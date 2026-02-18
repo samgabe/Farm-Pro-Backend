@@ -1,0 +1,356 @@
+package api
+
+import (
+	"context"
+	"fmt"
+	"math"
+	"net/http"
+	"time"
+)
+
+func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	var totalAnimals, sickAnimals, upcomingVaccines int64
+	var monthlyRevenue float64
+
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM animals WHERE is_active = true`).Scan(&totalAnimals)
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM animals WHERE health_status <> 'healthy' AND is_active = true`).Scan(&sickAnimals)
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM health_records WHERE next_due >= CURRENT_DATE AND next_due <= CURRENT_DATE + INTERVAL '7 days'`).Scan(&upcomingVaccines)
+	_ = s.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(total_amount), 0)
+		FROM sales
+		WHERE DATE_TRUNC('month', sale_date) = DATE_TRUNC('month', CURRENT_DATE)
+	`).Scan(&monthlyRevenue)
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"totalAnimals":         totalAnimals,
+		"sickAnimals":          sickAnimals,
+		"upcomingVaccinations": upcomingVaccines,
+		"monthlyRevenue":       monthlyRevenue,
+	})
+}
+
+func (s *Server) handleAnimals(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	page, pageSize := parsePagination(r)
+	search := parseSearch(r)
+	offset := (page - 1) * pageSize
+
+	var total int64
+	_ = s.db.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM animals
+		WHERE is_active = true
+			AND ($1 = '' OR tag_id ILIKE '%' || $1 || '%' OR type ILIKE '%' || $1 || '%' OR breed ILIKE '%' || $1 || '%')
+	`, search).Scan(&total)
+
+	rows, err := s.db.Query(ctx, `
+		SELECT id, tag_id, type, breed,
+			COALESCE(EXTRACT(YEAR FROM AGE(CURRENT_DATE, birth_date))::int::text || ' years', 'N/A') AS age,
+			COALESCE(weight_kg::text || ' kg', 'N/A') AS weight,
+			health_status, status
+		FROM animals
+		WHERE is_active = true
+			AND ($1 = '' OR tag_id ILIKE '%' || $1 || '%' OR type ILIKE '%' || $1 || '%' OR breed ILIKE '%' || $1 || '%')
+		ORDER BY tag_id
+		LIMIT $2 OFFSET $3
+	`, search, pageSize, offset)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load animals"})
+		return
+	}
+	defer rows.Close()
+
+	out := make([]map[string]any, 0)
+	for rows.Next() {
+		var id int64
+		var tagID, typ, breed, age, weight, health, status string
+		if err := rows.Scan(&id, &tagID, &typ, &breed, &age, &weight, &health, &status); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse animals"})
+			return
+		}
+		out = append(out, map[string]any{
+			"id":    id,
+			"tagId": tagID, "type": typ, "breed": breed, "age": age, "weight": weight, "health": health, "status": status,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"items":    out,
+		"total":    total,
+		"page":     page,
+		"pageSize": pageSize,
+	})
+}
+
+func (s *Server) handleUpcomingVaccinations(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	rows, err := s.db.Query(ctx, `
+		SELECT a.tag_id, a.type, h.treatment, h.next_due,
+			(h.next_due - CURRENT_DATE)::int
+		FROM health_records h
+		JOIN animals a ON a.id = h.animal_id
+		WHERE h.next_due >= CURRENT_DATE
+		ORDER BY h.next_due
+		LIMIT 20
+	`)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load upcoming vaccinations"})
+		return
+	}
+	defer rows.Close()
+
+	out := make([]map[string]any, 0)
+	for rows.Next() {
+		var id, animal, treatment string
+		var due time.Time
+		var days int
+		if err := rows.Scan(&id, &animal, &treatment, &due, &days); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse upcoming vaccinations"})
+			return
+		}
+		out = append(out, map[string]any{
+			"id": id,
+			"animal": animal,
+			"treatment": treatment,
+			"dueDate": due.Format("1/2/2006"),
+			"remaining": fmt.Sprintf("%d days remaining", days),
+		})
+	}
+
+	respondJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleHealthRecords(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	rows, err := s.db.Query(ctx, `
+		SELECT h.id, a.tag_id, h.action, h.treatment, h.record_date, h.veterinarian, h.next_due
+		FROM health_records h
+		JOIN animals a ON a.id = h.animal_id
+		ORDER BY h.record_date DESC
+	`)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load health records"})
+		return
+	}
+	defer rows.Close()
+
+	out := make([]map[string]any, 0)
+	for rows.Next() {
+		var id int64
+		var animalID, action, treatment, vet string
+		var date time.Time
+		var nextDue *time.Time
+		if err := rows.Scan(&id, &animalID, &action, &treatment, &date, &vet, &nextDue); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse health records"})
+			return
+		}
+		next := "N/A"
+		if nextDue != nil {
+			next = nextDue.Format("1/2/2006")
+		}
+		out = append(out, map[string]any{
+			"id": id,
+			"animalId": animalID,
+			"action": action,
+			"treatment": treatment,
+			"date": date.Format("1/2/2006"),
+			"vet": vet,
+			"nextDue": next,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleBreedingActive(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	rows, err := s.db.Query(ctx, `
+		SELECT b.id, m.tag_id, f.tag_id, b.species, b.breeding_date, b.expected_birth_date
+		FROM breeding_records b
+		JOIN animals m ON m.id = b.mother_animal_id
+		JOIN animals f ON f.id = b.father_animal_id
+		WHERE b.status = 'active' AND b.expected_birth_date IS NOT NULL
+		ORDER BY b.expected_birth_date
+	`)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load breeding records"})
+		return
+	}
+	defer rows.Close()
+
+	out := make([]map[string]any, 0)
+	for rows.Next() {
+		var id int64
+		var mother, father, species string
+		var breedDate, expected time.Time
+		if err := rows.Scan(&id, &mother, &father, &species, &breedDate, &expected); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse breeding records"})
+			return
+		}
+
+		totalDays := int(expected.Sub(breedDate).Hours() / 24)
+		elapsed := int(time.Since(breedDate).Hours() / 24)
+		progress := 0
+		if totalDays > 0 {
+			progress = int(math.Max(0, math.Min(100, float64(elapsed*100)/float64(totalDays))))
+		}
+
+		daysRemaining := int(time.Until(expected).Hours() / 24)
+		if daysRemaining < 0 {
+			daysRemaining = 0
+		}
+
+		out = append(out, map[string]any{
+			"id": id,
+			"mother": mother,
+			"father": father,
+			"animal": species,
+			"breedDate": breedDate.Format("1/2/2006"),
+			"expected": expected.Format("1/2/2006"),
+			"days": fmt.Sprintf("%d days", daysRemaining),
+			"progress": progress,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleBreedingBirths(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	rows, err := s.db.Query(ctx, `
+		SELECT m.tag_id, b.species, b.actual_birth_date, COALESCE(b.offspring_count, 0), m.health_status
+		FROM breeding_records b
+		JOIN animals m ON m.id = b.mother_animal_id
+		WHERE b.actual_birth_date IS NOT NULL
+		ORDER BY b.actual_birth_date DESC
+		LIMIT 20
+	`)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load recent births"})
+		return
+	}
+	defer rows.Close()
+
+	out := make([]map[string]any, 0)
+	for rows.Next() {
+		var mother, typ, health string
+		var birth time.Time
+		var offspring int
+		if err := rows.Scan(&mother, &typ, &birth, &offspring, &health); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse recent births"})
+			return
+		}
+		out = append(out, map[string]any{
+			"mother": mother,
+			"type": typ,
+			"date": birth.Format("1/2/2006"),
+			"offspring": offspring,
+			"health": health,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleProductionSummary(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	var milk, eggs, wool, value float64
+	err := s.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(milk_liters),0), COALESCE(SUM(eggs_count),0), COALESCE(SUM(wool_kg),0), COALESCE(SUM(total_value),0)
+		FROM production_logs
+		WHERE log_date >= CURRENT_DATE - INTERVAL '6 days'
+	`).Scan(&milk, &eggs, &wool, &value)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load production summary"})
+		return
+	}
+
+	var previousValue float64
+	_ = s.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(total_value),0)
+		FROM production_logs
+		WHERE log_date >= CURRENT_DATE - INTERVAL '13 days'
+			AND log_date < CURRENT_DATE - INTERVAL '6 days'
+	`).Scan(&previousValue)
+
+	productivityChange := 0.0
+	if previousValue > 0 {
+		productivityChange = ((value - previousValue) / previousValue) * 100
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"weeklyMilk":         milk,
+		"weeklyEggs":         eggs,
+		"weeklyWool":         wool,
+		"weeklyValue":        value,
+		"productivityChange": productivityChange,
+	})
+}
+
+func (s *Server) handleProductionLogs(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	page, pageSize := parsePagination(r)
+	offset := (page - 1) * pageSize
+	var total int64
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM production_logs`).Scan(&total)
+
+	rows, err := s.db.Query(ctx, `
+		SELECT id, log_date, milk_liters, eggs_count, wool_kg, total_value
+		FROM production_logs
+		ORDER BY log_date DESC
+		LIMIT $1 OFFSET $2
+	`, pageSize, offset)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load production logs"})
+		return
+	}
+	defer rows.Close()
+
+	out := make([]map[string]any, 0)
+	for rows.Next() {
+		var id int64
+		var d time.Time
+		var milk, eggs, wool, total float64
+		if err := rows.Scan(&id, &d, &milk, &eggs, &wool, &total); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse production logs"})
+			return
+		}
+		out = append(out, map[string]any{
+			"id":        id,
+			"date":      d.Format("Mon, Jan 2"),
+			"dateRaw":   d.Format("2006-01-02"),
+			"milk":      fmt.Sprintf("%.0f L", milk),
+			"milkValue": milk,
+			"eggs":      fmt.Sprintf("%.0f units", eggs),
+			"eggsValue": eggs,
+			"wool":      fmt.Sprintf("%.0f kg", wool),
+			"woolValue": wool,
+			"total":     fmt.Sprintf("$%.2f", total),
+			"totalValue": total,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"items":    out,
+		"total":    total,
+		"page":     page,
+		"pageSize": pageSize,
+	})
+}
