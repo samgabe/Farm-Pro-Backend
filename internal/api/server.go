@@ -2,22 +2,62 @@ package api
 
 import (
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type Server struct {
-	db        *pgxpool.Pool
-	jwtSecret []byte
+	db              *pgxpool.Pool
+	jwtSecret       []byte
+	allowAnyOrigin  bool
+	allowedOrigins  map[string]struct{}
+	loginLimiter    *attemptLimiter
+	registerLimiter *attemptLimiter
+	mailer          *smtpMailer
+	frontendBaseURL string
+	kraPIN          string
+	location        *time.Location
 }
 
 type authContextKey string
 
 const userIDContextKey authContextKey = "user_id"
 const userRoleContextKey authContextKey = "user_role"
+const userPermissionsContextKey authContextKey = "user_permissions"
 
-func NewServer(db *pgxpool.Pool, jwtSecret string) *Server {
-	return &Server{db: db, jwtSecret: []byte(jwtSecret)}
+func NewServer(db *pgxpool.Pool, jwtSecret string, corsAllowedOrigins []string, mailer *smtpMailer, frontendBaseURL string, appTimezone string, kraPIN string) *Server {
+	allowedOrigins := make(map[string]struct{}, len(corsAllowedOrigins))
+	allowAnyOrigin := false
+	for _, raw := range corsAllowedOrigins {
+		origin := strings.TrimSpace(raw)
+		if origin == "" {
+			continue
+		}
+		if origin == "*" {
+			allowAnyOrigin = true
+			continue
+		}
+		allowedOrigins[origin] = struct{}{}
+	}
+	loc, err := time.LoadLocation(strings.TrimSpace(appTimezone))
+	if err != nil {
+		loc = time.UTC
+	}
+
+	return &Server{
+		db:              db,
+		jwtSecret:       []byte(jwtSecret),
+		allowAnyOrigin:  allowAnyOrigin,
+		allowedOrigins:  allowedOrigins,
+		loginLimiter:    newAttemptLimiter(12, time.Minute),
+		registerLimiter: newAttemptLimiter(5, 15*time.Minute),
+		mailer:          mailer,
+		frontendBaseURL: strings.TrimRight(strings.TrimSpace(frontendBaseURL), "/"),
+		kraPIN:          strings.ToUpper(strings.TrimSpace(kraPIN)),
+		location:        loc,
+	}
 }
 
 func (s *Server) Mux() http.Handler {
@@ -29,47 +69,54 @@ func (s *Server) Mux() http.Handler {
 
 	mux.HandleFunc("POST /api/auth/register", s.handleRegister)
 	mux.HandleFunc("POST /api/auth/login", s.handleLogin)
+	mux.HandleFunc("POST /api/auth/forgot-password", s.handleForgotPassword)
+	mux.HandleFunc("POST /api/auth/reset-password", s.handleResetPassword)
+	mux.HandleFunc("POST /api/auth/verify-email", s.handleVerifyEmail)
 	mux.Handle("GET /api/auth/me", s.authRequired(http.HandlerFunc(s.handleMe)))
 
-	mux.Handle("GET /api/dashboard", s.authRequired(http.HandlerFunc(s.handleDashboard)))
-	mux.Handle("GET /api/animals", s.authRequired(http.HandlerFunc(s.handleAnimals)))
-	mux.Handle("POST /api/animals", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleCreateAnimal), "owner", "manager")))
-	mux.Handle("PUT /api/animals/{tagId}", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleUpdateAnimal), "owner", "manager")))
-	mux.Handle("DELETE /api/animals/{tagId}", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleDeleteAnimal), "owner", "manager")))
-	mux.Handle("GET /api/health/upcoming", s.authRequired(http.HandlerFunc(s.handleUpcomingVaccinations)))
-	mux.Handle("GET /api/health/records", s.authRequired(http.HandlerFunc(s.handleHealthRecords)))
-	mux.Handle("POST /api/health/records", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleCreateHealthRecord), "owner", "manager", "veterinarian")))
-	mux.Handle("PUT /api/health/records/{id}", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleUpdateHealthRecord), "owner", "manager", "veterinarian")))
-	mux.Handle("DELETE /api/health/records/{id}", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleDeleteHealthRecord), "owner", "manager", "veterinarian")))
-	mux.Handle("GET /api/breeding/active", s.authRequired(http.HandlerFunc(s.handleBreedingActive)))
-	mux.Handle("GET /api/breeding/births", s.authRequired(http.HandlerFunc(s.handleBreedingBirths)))
-	mux.Handle("POST /api/breeding", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleCreateBreedingRecord), "owner", "manager")))
-	mux.Handle("PUT /api/breeding/{id}", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleUpdateBreedingRecord), "owner", "manager")))
-	mux.Handle("DELETE /api/breeding/{id}", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleDeleteBreedingRecord), "owner", "manager")))
-	mux.Handle("GET /api/production/summary", s.authRequired(http.HandlerFunc(s.handleProductionSummary)))
-	mux.Handle("GET /api/production/logs", s.authRequired(http.HandlerFunc(s.handleProductionLogs)))
-	mux.Handle("POST /api/production/logs", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleCreateProductionLog), "owner", "manager", "worker")))
-	mux.Handle("PUT /api/production/logs/{id}", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleUpdateProductionLog), "owner", "manager")))
-	mux.Handle("DELETE /api/production/logs/{id}", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleDeleteProductionLog), "owner", "manager")))
-	mux.Handle("GET /api/expenses/summary", s.authRequired(http.HandlerFunc(s.handleExpensesSummary)))
-	mux.Handle("GET /api/expenses", s.authRequired(http.HandlerFunc(s.handleExpenses)))
-	mux.Handle("POST /api/expenses", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleCreateExpense), "owner", "manager")))
-	mux.Handle("PUT /api/expenses/{id}", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleUpdateExpense), "owner", "manager")))
-	mux.Handle("DELETE /api/expenses/{id}", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleDeleteExpense), "owner", "manager")))
-	mux.Handle("GET /api/sales/summary", s.authRequired(http.HandlerFunc(s.handleSalesSummary)))
-	mux.Handle("GET /api/sales", s.authRequired(http.HandlerFunc(s.handleSales)))
-	mux.Handle("POST /api/sales", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleCreateSale), "owner", "manager")))
-	mux.Handle("PUT /api/sales/{id}", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleUpdateSale), "owner", "manager")))
-	mux.Handle("DELETE /api/sales/{id}", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleDeleteSale), "owner", "manager")))
-	mux.Handle("GET /api/reports/stats", s.authRequired(http.HandlerFunc(s.handleReportStats)))
-	mux.Handle("GET /api/reports", s.authRequired(http.HandlerFunc(s.handleReports)))
-	mux.Handle("POST /api/reports/generate", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleGenerateReport), "owner", "manager")))
-	mux.Handle("GET /api/reports/{id}/download", s.authRequired(http.HandlerFunc(s.handleDownloadReport)))
-	mux.Handle("GET /api/users/stats", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleUserStats), "owner", "manager")))
-	mux.Handle("GET /api/users", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleUsers), "owner", "manager")))
-	mux.Handle("POST /api/users", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleCreateUser), "owner")))
-	mux.Handle("PUT /api/users/{id}", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleUpdateUser), "owner")))
-	mux.Handle("DELETE /api/users/{id}", s.authRequired(s.roleRequired(http.HandlerFunc(s.handleDeleteUser), "owner")))
+	mux.Handle("GET /api/dashboard", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDashboard), "dashboard.read")))
+	mux.Handle("GET /api/animals", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleAnimals), "animals.read")))
+	mux.Handle("POST /api/animals", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreateAnimal), "animals.write")))
+	mux.Handle("PUT /api/animals/{tagId}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUpdateAnimal), "animals.write")))
+	mux.Handle("DELETE /api/animals/{tagId}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDeleteAnimal), "animals.write")))
+	mux.Handle("GET /api/health/upcoming", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUpcomingVaccinations), "health.read")))
+	mux.Handle("GET /api/health/records", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleHealthRecords), "health.read")))
+	mux.Handle("POST /api/health/records", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreateHealthRecord), "health.write")))
+	mux.Handle("PUT /api/health/records/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUpdateHealthRecord), "health.write")))
+	mux.Handle("DELETE /api/health/records/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDeleteHealthRecord), "health.write")))
+	mux.Handle("GET /api/breeding/active", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleBreedingActive), "breeding.read")))
+	mux.Handle("GET /api/breeding/births", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleBreedingBirths), "breeding.read")))
+	mux.Handle("POST /api/breeding", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreateBreedingRecord), "breeding.write")))
+	mux.Handle("PUT /api/breeding/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUpdateBreedingRecord), "breeding.write")))
+	mux.Handle("POST /api/breeding/{id}/birth", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleRecordBirth), "breeding.write")))
+	mux.Handle("DELETE /api/breeding/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDeleteBreedingRecord), "breeding.write")))
+	mux.Handle("GET /api/production/summary", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleProductionSummary), "production.read")))
+	mux.Handle("GET /api/production/logs", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleProductionLogs), "production.read")))
+	mux.Handle("POST /api/production/logs", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreateProductionLog), "production.create")))
+	mux.Handle("PUT /api/production/logs/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUpdateProductionLog), "production.manage")))
+	mux.Handle("DELETE /api/production/logs/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDeleteProductionLog), "production.manage")))
+	mux.Handle("GET /api/expenses/summary", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleExpensesSummary), "expenses.read")))
+	mux.Handle("GET /api/expenses", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleExpenses), "expenses.read")))
+	mux.Handle("POST /api/expenses", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreateExpense), "expenses.write")))
+	mux.Handle("PUT /api/expenses/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUpdateExpense), "expenses.write")))
+	mux.Handle("DELETE /api/expenses/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDeleteExpense), "expenses.write")))
+	mux.Handle("GET /api/sales/summary", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleSalesSummary), "sales.read")))
+	mux.Handle("GET /api/sales", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleSales), "sales.read")))
+	mux.Handle("POST /api/sales", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreateSale), "sales.write")))
+	mux.Handle("PUT /api/sales/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUpdateSale), "sales.write")))
+	mux.Handle("DELETE /api/sales/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDeleteSale), "sales.write")))
+	mux.Handle("GET /api/reports/stats", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleReportStats), "reports.read")))
+	mux.Handle("GET /api/reports", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleReports), "reports.read")))
+	mux.Handle("POST /api/reports/generate", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleGenerateReport), "reports.generate")))
+	mux.Handle("GET /api/reports/{id}/download", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDownloadReport), "reports.read")))
+	mux.Handle("GET /api/etims/receipts", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleEtimsReceipts), "etims.manage")))
+	mux.Handle("POST /api/etims/receipts/generate/{saleId}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleEtimsGenerateReceipt), "etims.manage")))
+	mux.Handle("GET /api/etims/receipts/{id}/download", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleEtimsDownloadReceipt), "etims.manage")))
+	mux.Handle("GET /api/users/stats", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUserStats), "users.read")))
+	mux.Handle("GET /api/users", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUsers), "users.read")))
+	mux.Handle("POST /api/users", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreateUser), "users.manage")))
+	mux.Handle("PUT /api/users/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUpdateUser), "users.manage")))
+	mux.Handle("DELETE /api/users/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDeleteUser), "users.manage")))
 
-	return withCORS(mux)
+	return s.withCORS(mux)
 }

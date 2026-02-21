@@ -7,8 +7,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"farmpro/backend/internal/api"
@@ -39,9 +41,30 @@ func main() {
 		log.Fatal(err)
 	}
 
-	srv := api.NewServer(pool, cfg.JWTSecret)
+	mailer := api.NewSMTPMailer(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUsername, cfg.SMTPPassword, cfg.FromName, cfg.FromEmail)
+	srv := api.NewServer(pool, cfg.JWTSecret, cfg.CORSAllowedOrigins, mailer, cfg.FrontendBaseURL, cfg.AppTimezone, cfg.KRAPIN)
+	httpServer := &http.Server{
+		Addr:         ":" + cfg.Port,
+		Handler:      srv.Mux(),
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 20 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		<-stopCtx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("graceful shutdown failed: %v", err)
+		}
+	}()
+
 	log.Printf("FarmPro backend running on :%s", cfg.Port)
-	if err := http.ListenAndServe(":"+cfg.Port, srv.Mux()); err != nil {
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }

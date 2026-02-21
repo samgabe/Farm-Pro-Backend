@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -31,32 +34,42 @@ func (s *Server) authRequired(next http.Handler) http.Handler {
 			return
 		}
 
-		uidStr := fmt.Sprint(claims["sub"])
-		uid, err := strconv.ParseInt(uidStr, 10, 64)
+		uid, err := parseTokenUserID(claims["sub"])
 		if err != nil {
 			respondJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid token subject"})
 			return
 		}
 
-		ctx := context.WithValue(r.Context(), userIDContextKey, uid)
-		role := strings.ToLower(strings.TrimSpace(fmt.Sprint(claims["role"])))
-		ctx = context.WithValue(ctx, userRoleContextKey, role)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		dbCtx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+		defer cancel()
+
+		role, permissions, err := s.loadAuthContext(dbCtx, uid)
+		if err != nil {
+			respondJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid user session"})
+			return
+		}
+
+		authCtx := context.WithValue(r.Context(), userIDContextKey, uid)
+		authCtx = context.WithValue(authCtx, userRoleContextKey, role)
+		authCtx = context.WithValue(authCtx, userPermissionsContextKey, permissions)
+		next.ServeHTTP(w, r.WithContext(authCtx))
 	})
 }
 
-func (s *Server) roleRequired(next http.Handler, allowedRoles ...string) http.Handler {
-	allowed := make(map[string]struct{}, len(allowedRoles))
-	for _, role := range allowedRoles {
-		allowed[strings.ToLower(strings.TrimSpace(role))] = struct{}{}
-	}
+func (s *Server) permissionRequired(next http.Handler, requiredPermission string) http.Handler {
+	requiredPermission = strings.TrimSpace(requiredPermission)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		role, _ := r.Context().Value(userRoleContextKey).(string)
-		if role == "" {
-			respondJSON(w, http.StatusForbidden, map[string]string{"error": "missing role in auth context"})
+		if requiredPermission == "" {
+			next.ServeHTTP(w, r)
 			return
 		}
-		if _, ok := allowed[role]; !ok {
+
+		permissions, ok := r.Context().Value(userPermissionsContextKey).(map[string]struct{})
+		if !ok {
+			respondJSON(w, http.StatusForbidden, map[string]string{"error": "missing permissions in auth context"})
+			return
+		}
+		if _, allowed := permissions[requiredPermission]; !allowed {
 			respondJSON(w, http.StatusForbidden, map[string]string{"error": "insufficient permissions"})
 			return
 		}
@@ -64,13 +77,14 @@ func (s *Server) roleRequired(next http.Handler, allowedRoles ...string) http.Ha
 	})
 }
 
-func withCORS(next http.Handler) http.Handler {
+func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin == "" {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-		} else {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
+		if origin != "" {
+			_, allowed := s.allowedOrigins[origin]
+			if s.allowAnyOrigin || allowed {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+			}
 		}
 		w.Header().Set("Vary", "Origin")
 		w.Header().Set("Vary", "Access-Control-Request-Method")
@@ -85,4 +99,46 @@ func withCORS(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func parseTokenUserID(raw any) (int64, error) {
+	switch v := raw.(type) {
+	case float64:
+		if v != math.Trunc(v) {
+			return 0, errors.New("non-integer subject")
+		}
+		return int64(v), nil
+	case int64:
+		return v, nil
+	case string:
+		return strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	default:
+		uidStr := fmt.Sprint(raw)
+		return strconv.ParseInt(uidStr, 10, 64)
+	}
+}
+
+func clientIP(r *http.Request) string {
+	forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For"))
+	if forwarded != "" {
+		parts := strings.Split(forwarded, ",")
+		if len(parts) > 0 {
+			candidate := strings.TrimSpace(parts[0])
+			if candidate != "" {
+				return candidate
+			}
+		}
+	}
+
+	hostPort := strings.TrimSpace(r.RemoteAddr)
+	if hostPort == "" {
+		return "unknown"
+	}
+	if addr, err := netip.ParseAddrPort(hostPort); err == nil {
+		return addr.Addr().String()
+	}
+	if addr, err := netip.ParseAddr(hostPort); err == nil {
+		return addr.String()
+	}
+	return hostPort
 }

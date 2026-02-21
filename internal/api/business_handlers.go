@@ -86,13 +86,13 @@ func (s *Server) handleExpenses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out = append(out, map[string]any{
-			"id":       id,
-			"date":     d.Format("Jan 2"),
-			"dateRaw":  d.Format("2006-01-02"),
-			"category": category,
-			"item": item,
-			"vendor": vendor,
-			"amount":   "$" + trimZero(amount),
+			"id":        id,
+			"date":      s.formatDateCompact(d),
+			"dateRaw":   s.formatISODate(d),
+			"category":  category,
+			"item":      item,
+			"vendor":    vendor,
+			"amount":    formatKES(amount),
 			"amountRaw": amount,
 		})
 	}
@@ -108,15 +108,15 @@ func (s *Server) handleSalesSummary(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	var total, dailyAvg float64
+	var total, netRevenue, vatCollected, dailyAvg float64
 	var topProduct string
 	var topAmount float64
 
 	_ = s.db.QueryRow(ctx, `
-		SELECT COALESCE(SUM(total_amount), 0)
+		SELECT COALESCE(SUM(total_amount), 0), COALESCE(SUM(net_amount), 0), COALESCE(SUM(vat_amount), 0)
 		FROM sales
 		WHERE DATE_TRUNC('month', sale_date) = DATE_TRUNC('month', CURRENT_DATE)
-	`).Scan(&total)
+	`).Scan(&total, &netRevenue, &vatCollected)
 	_ = s.db.QueryRow(ctx, `
 		SELECT COALESCE(AVG(day_total), 0)
 		FROM (
@@ -136,6 +136,8 @@ func (s *Server) handleSalesSummary(w http.ResponseWriter, r *http.Request) {
 
 	respondJSON(w, http.StatusOK, map[string]any{
 		"totalRevenue": total,
+		"netRevenue":   netRevenue,
+		"vatCollected": vatCollected,
 		"dailyAverage": dailyAvg,
 		"topProduct":   topProduct,
 		"topAmount":    topAmount,
@@ -158,7 +160,8 @@ func (s *Server) handleSales(w http.ResponseWriter, r *http.Request) {
 	`, search).Scan(&totalRows)
 
 	rows, err := s.db.Query(ctx, `
-		SELECT id, sale_date, product, quantity_value, quantity_unit, buyer, price_per_unit, total_amount
+		SELECT id, sale_date, product, quantity_value, quantity_unit, buyer, buyer_pin, delivery_county, delivery_subcounty,
+		       vat_applicable, vat_rate, vat_amount, net_amount, price_per_unit, total_amount
 		FROM sales
 		WHERE ($1 = '' OR product ILIKE '%' || $1 || '%' OR buyer ILIKE '%' || $1 || '%')
 		ORDER BY sale_date DESC, id DESC
@@ -174,24 +177,36 @@ func (s *Server) handleSales(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id int64
 		var d time.Time
-		var product, unit, buyer string
-		var qty, price, total float64
-		if err := rows.Scan(&id, &d, &product, &qty, &unit, &buyer, &price, &total); err != nil {
+		var product, unit, buyer, buyerPIN, county, subcounty string
+		var qty, price, total, vatRate, vatAmount, netAmount float64
+		var vatApplicable bool
+		if err := rows.Scan(
+			&id, &d, &product, &qty, &unit, &buyer, &buyerPIN, &county, &subcounty,
+			&vatApplicable, &vatRate, &vatAmount, &netAmount, &price, &total,
+		); err != nil {
 			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse sales"})
 			return
 		}
 		out = append(out, map[string]any{
-			"id":            id,
-			"date":          d.Format("Jan 2"),
-			"dateRaw":       d.Format("2006-01-02"),
-			"product":       product,
-			"quantity":      trimZero(qty) + " " + unit,
-			"quantityValue": qty,
-			"quantityUnit":  unit,
-			"buyer":         buyer,
-			"price":         "$" + trimZero(price),
-			"pricePerUnit":  price,
-			"total":         "$" + trimZero(total),
+			"id":                id,
+			"date":              s.formatDateCompact(d),
+			"dateRaw":           s.formatISODate(d),
+			"product":           product,
+			"quantity":          trimZero(qty) + " " + unit,
+			"quantityValue":     qty,
+			"quantityUnit":      unit,
+			"buyer":             buyer,
+			"buyerPIN":          buyerPIN,
+			"deliveryCounty":    county,
+			"deliverySubcounty": subcounty,
+			"vatApplicable":     vatApplicable,
+			"vatRate":           vatRate,
+			"vatAmount":         vatAmount,
+			"netAmount":         netAmount,
+			"price":             formatKES(price),
+			"pricePerUnit":      price,
+			"total":             formatKES(total),
+			"totalAmount":       total,
 		})
 	}
 
@@ -207,19 +222,26 @@ func (s *Server) handleReportStats(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	var revenue, expense float64
+	var grossRevenue, netRevenue, vatCollected, expense float64
 	var animals int64
-	_ = s.db.QueryRow(ctx, `SELECT COALESCE(SUM(total_amount),0) FROM sales WHERE DATE_TRUNC('month', sale_date) = DATE_TRUNC('month', CURRENT_DATE)`).Scan(&revenue)
+	_ = s.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(total_amount),0), COALESCE(SUM(net_amount),0), COALESCE(SUM(vat_amount),0)
+		FROM sales
+		WHERE DATE_TRUNC('month', sale_date) = DATE_TRUNC('month', CURRENT_DATE)
+	`).Scan(&grossRevenue, &netRevenue, &vatCollected)
 	_ = s.db.QueryRow(ctx, `SELECT COALESCE(SUM(amount),0) FROM expenses WHERE DATE_TRUNC('month', expense_date) = DATE_TRUNC('month', CURRENT_DATE)`).Scan(&expense)
 	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM animals WHERE is_active = true`).Scan(&animals)
 
-	profit := revenue - expense
+	profit := netRevenue - expense
 	productivity := 0
-	if revenue > 0 {
-		productivity = int(math.Round((profit / revenue) * 100))
+	if netRevenue > 0 {
+		productivity = int(math.Round((profit / netRevenue) * 100))
 	}
 
 	respondJSON(w, http.StatusOK, map[string]any{
+		"grossRevenue":     grossRevenue,
+		"netRevenue":       netRevenue,
+		"vatCollected":     vatCollected,
 		"monthlyProfit":    profit,
 		"totalAnimals":     animals,
 		"operatingCosts":   expense,
@@ -231,12 +253,17 @@ func (s *Server) handleReports(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
+	page, pageSize := parsePagination(r)
+	offset := (page - 1) * pageSize
+	var total int64
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM reports`).Scan(&total)
+
 	rows, err := s.db.Query(ctx, `
 		SELECT id, title, description, category, last_generated
 		FROM reports
 		ORDER BY last_generated DESC, id DESC
-		LIMIT 20
-	`)
+		LIMIT $1 OFFSET $2
+	`, pageSize, offset)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load reports"})
 		return
@@ -261,10 +288,15 @@ func (s *Server) handleReports(w http.ResponseWriter, r *http.Request) {
 			"category":  category,
 			"dateRange": dateRange,
 			"format":    format,
-			"generated": generated.Format("January 2, 2006"),
+			"generated": s.formatDateLong(generated),
 		})
 	}
-	respondJSON(w, http.StatusOK, out)
+	respondJSON(w, http.StatusOK, map[string]any{
+		"items":    out,
+		"total":    total,
+		"page":     page,
+		"pageSize": pageSize,
+	})
 }
 
 func (s *Server) handleUserStats(w http.ResponseWriter, r *http.Request) {
@@ -274,8 +306,18 @@ func (s *Server) handleUserStats(w http.ResponseWriter, r *http.Request) {
 	var total, active, managers, vets int64
 	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&total)
 	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE status = 'active'`).Scan(&active)
-	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE role = 'manager'`).Scan(&managers)
-	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE role = 'veterinarian'`).Scan(&vets)
+	_ = s.db.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM users u
+		JOIN roles r ON r.id = u.role_id
+		WHERE r.name = 'manager'
+	`).Scan(&managers)
+	_ = s.db.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM users u
+		JOIN roles r ON r.id = u.role_id
+		WHERE r.name = 'veterinarian'
+	`).Scan(&vets)
 
 	respondJSON(w, http.StatusOK, map[string]any{
 		"totalStaff":    total,
@@ -296,15 +338,17 @@ func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
 	var total int64
 	_ = s.db.QueryRow(ctx, `
 		SELECT COUNT(*)
-		FROM users
-		WHERE ($1 = '' OR name ILIKE '%' || $1 || '%' OR email ILIKE '%' || $1 || '%' OR role ILIKE '%' || $1 || '%')
+		FROM users u
+		JOIN roles r ON r.id = u.role_id
+		WHERE ($1 = '' OR u.name ILIKE '%' || $1 || '%' OR u.email ILIKE '%' || $1 || '%' OR r.name ILIKE '%' || $1 || '%')
 	`, search).Scan(&total)
 
 	rows, err := s.db.Query(ctx, `
-		SELECT id, name, role, email, phone, status
-		FROM users
-		WHERE ($1 = '' OR name ILIKE '%' || $1 || '%' OR email ILIKE '%' || $1 || '%' OR role ILIKE '%' || $1 || '%')
-		ORDER BY id
+		SELECT u.id, u.name, r.name, u.email, u.phone, u.status
+		FROM users u
+		JOIN roles r ON r.id = u.role_id
+		WHERE ($1 = '' OR u.name ILIKE '%' || $1 || '%' OR u.email ILIKE '%' || $1 || '%' OR r.name ILIKE '%' || $1 || '%')
+		ORDER BY u.id
 		LIMIT $2 OFFSET $3
 	`, search, pageSize, offset)
 	if err != nil {

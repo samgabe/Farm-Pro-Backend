@@ -13,22 +13,25 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	var totalAnimals, sickAnimals, upcomingVaccines int64
-	var monthlyRevenue float64
+	var monthlyGrossRevenue, monthlyNetRevenue, monthlyVATCollected float64
 
 	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM animals WHERE is_active = true`).Scan(&totalAnimals)
 	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM animals WHERE health_status <> 'healthy' AND is_active = true`).Scan(&sickAnimals)
 	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM health_records WHERE next_due >= CURRENT_DATE AND next_due <= CURRENT_DATE + INTERVAL '7 days'`).Scan(&upcomingVaccines)
 	_ = s.db.QueryRow(ctx, `
-		SELECT COALESCE(SUM(total_amount), 0)
+		SELECT COALESCE(SUM(total_amount), 0), COALESCE(SUM(net_amount), 0), COALESCE(SUM(vat_amount), 0)
 		FROM sales
 		WHERE DATE_TRUNC('month', sale_date) = DATE_TRUNC('month', CURRENT_DATE)
-	`).Scan(&monthlyRevenue)
+	`).Scan(&monthlyGrossRevenue, &monthlyNetRevenue, &monthlyVATCollected)
 
 	respondJSON(w, http.StatusOK, map[string]any{
 		"totalAnimals":         totalAnimals,
 		"sickAnimals":          sickAnimals,
 		"upcomingVaccinations": upcomingVaccines,
-		"monthlyRevenue":       monthlyRevenue,
+		"monthlyRevenue":       monthlyGrossRevenue,
+		"monthlyGrossRevenue":  monthlyGrossRevenue,
+		"monthlyNetRevenue":    monthlyNetRevenue,
+		"monthlyVATCollected":  monthlyVATCollected,
 	})
 }
 
@@ -49,8 +52,13 @@ func (s *Server) handleAnimals(w http.ResponseWriter, r *http.Request) {
 	`, search).Scan(&total)
 
 	rows, err := s.db.Query(ctx, `
-		SELECT id, tag_id, type, breed,
-			COALESCE(EXTRACT(YEAR FROM AGE(CURRENT_DATE, birth_date))::int::text || ' years', 'N/A') AS age,
+		SELECT id, tag_id, type, breed, birth_date,
+			CASE
+				WHEN birth_date IS NULL THEN 'N/A'
+				WHEN CURRENT_DATE - birth_date < 30 THEN (CURRENT_DATE - birth_date)::int::text || ' days'
+				WHEN AGE(CURRENT_DATE, birth_date) < INTERVAL '1 year' THEN EXTRACT(MONTH FROM AGE(CURRENT_DATE, birth_date))::int::text || ' months'
+				ELSE EXTRACT(YEAR FROM AGE(CURRENT_DATE, birth_date))::int::text || ' years'
+			END AS age,
 			COALESCE(weight_kg::text || ' kg', 'N/A') AS weight,
 			health_status, status
 		FROM animals
@@ -68,14 +76,26 @@ func (s *Server) handleAnimals(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
 	for rows.Next() {
 		var id int64
+		var birthDate *time.Time
 		var tagID, typ, breed, age, weight, health, status string
-		if err := rows.Scan(&id, &tagID, &typ, &breed, &age, &weight, &health, &status); err != nil {
+		if err := rows.Scan(&id, &tagID, &typ, &breed, &birthDate, &age, &weight, &health, &status); err != nil {
 			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse animals"})
 			return
 		}
+		birthDateRaw := ""
+		if birthDate != nil {
+			birthDateRaw = s.formatISODate(*birthDate)
+		}
 		out = append(out, map[string]any{
-			"id":    id,
-			"tagId": tagID, "type": typ, "breed": breed, "age": age, "weight": weight, "health": health, "status": status,
+			"id":        id,
+			"tagId":     tagID,
+			"type":      typ,
+			"breed":     breed,
+			"birthDate": birthDateRaw,
+			"age":       age,
+			"weight":    weight,
+			"health":    health,
+			"status":    status,
 		})
 	}
 
@@ -116,10 +136,10 @@ func (s *Server) handleUpcomingVaccinations(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		out = append(out, map[string]any{
-			"id": id,
-			"animal": animal,
+			"id":        id,
+			"animal":    animal,
 			"treatment": treatment,
-			"dueDate": due.Format("1/2/2006"),
+			"dueDate":   s.formatDate(due),
 			"remaining": fmt.Sprintf("%d days remaining", days),
 		})
 	}
@@ -155,16 +175,16 @@ func (s *Server) handleHealthRecords(w http.ResponseWriter, r *http.Request) {
 		}
 		next := "N/A"
 		if nextDue != nil {
-			next = nextDue.Format("1/2/2006")
+			next = s.formatDate(*nextDue)
 		}
 		out = append(out, map[string]any{
-			"id": id,
-			"animalId": animalID,
-			"action": action,
+			"id":        id,
+			"animalId":  animalID,
+			"action":    action,
 			"treatment": treatment,
-			"date": date.Format("1/2/2006"),
-			"vet": vet,
-			"nextDue": next,
+			"date":      s.formatDate(date),
+			"vet":       vet,
+			"nextDue":   next,
 		})
 	}
 
@@ -176,7 +196,7 @@ func (s *Server) handleBreedingActive(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	rows, err := s.db.Query(ctx, `
-		SELECT b.id, m.tag_id, f.tag_id, b.species, b.breeding_date, b.expected_birth_date
+		SELECT b.id, m.tag_id, f.tag_id, b.species, b.breeding_date, b.expected_birth_date, COALESCE(b.notes, '')
 		FROM breeding_records b
 		JOIN animals m ON m.id = b.mother_animal_id
 		JOIN animals f ON f.id = b.father_animal_id
@@ -192,9 +212,9 @@ func (s *Server) handleBreedingActive(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
 	for rows.Next() {
 		var id int64
-		var mother, father, species string
+		var mother, father, species, notes string
 		var breedDate, expected time.Time
-		if err := rows.Scan(&id, &mother, &father, &species, &breedDate, &expected); err != nil {
+		if err := rows.Scan(&id, &mother, &father, &species, &breedDate, &expected, &notes); err != nil {
 			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse breeding records"})
 			return
 		}
@@ -212,14 +232,15 @@ func (s *Server) handleBreedingActive(w http.ResponseWriter, r *http.Request) {
 		}
 
 		out = append(out, map[string]any{
-			"id": id,
-			"mother": mother,
-			"father": father,
-			"animal": species,
-			"breedDate": breedDate.Format("1/2/2006"),
-			"expected": expected.Format("1/2/2006"),
-			"days": fmt.Sprintf("%d days", daysRemaining),
-			"progress": progress,
+			"id":        id,
+			"mother":    mother,
+			"father":    father,
+			"animal":    species,
+			"breedDate": s.formatDate(breedDate),
+			"expected":  s.formatDate(expected),
+			"days":      fmt.Sprintf("%d days", daysRemaining),
+			"progress":  progress,
+			"notes":     notes,
 		})
 	}
 
@@ -254,11 +275,11 @@ func (s *Server) handleBreedingBirths(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out = append(out, map[string]any{
-			"mother": mother,
-			"type": typ,
-			"date": birth.Format("1/2/2006"),
+			"mother":    mother,
+			"type":      typ,
+			"date":      s.formatDate(birth),
 			"offspring": offspring,
-			"health": health,
+			"health":    health,
 		})
 	}
 
@@ -333,16 +354,16 @@ func (s *Server) handleProductionLogs(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		out = append(out, map[string]any{
-			"id":        id,
-			"date":      d.Format("Mon, Jan 2"),
-			"dateRaw":   d.Format("2006-01-02"),
-			"milk":      fmt.Sprintf("%.0f L", milk),
-			"milkValue": milk,
-			"eggs":      fmt.Sprintf("%.0f units", eggs),
-			"eggsValue": eggs,
-			"wool":      fmt.Sprintf("%.0f kg", wool),
-			"woolValue": wool,
-			"total":     fmt.Sprintf("$%.2f", total),
+			"id":         id,
+			"date":       s.formatDateCompact(d),
+			"dateRaw":    s.formatISODate(d),
+			"milk":       fmt.Sprintf("%.0f L", milk),
+			"milkValue":  milk,
+			"eggs":       fmt.Sprintf("%.0f units", eggs),
+			"eggsValue":  eggs,
+			"wool":       fmt.Sprintf("%.0f kg", wool),
+			"woolValue":  wool,
+			"total":      formatKES(total),
 			"totalValue": total,
 		})
 	}

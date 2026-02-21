@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -12,13 +13,13 @@ import (
 )
 
 type reportContent struct {
-	ID          int64          `json:"id"`
-	Title       string         `json:"title"`
-	Category    string         `json:"category"`
-	DateRange   string         `json:"dateRange"`
-	Format      string         `json:"format"`
-	GeneratedOn string         `json:"generatedOn"`
-	Summary     map[string]any `json:"summary"`
+	ID          int64            `json:"id"`
+	Title       string           `json:"title"`
+	Category    string           `json:"category"`
+	DateRange   string           `json:"dateRange"`
+	Format      string           `json:"format"`
+	GeneratedOn string           `json:"generatedOn"`
+	Summary     map[string]any   `json:"summary"`
 	Records     []map[string]any `json:"records"`
 }
 
@@ -120,7 +121,7 @@ func (s *Server) buildReportContent(ctx context.Context, id int64, title string,
 		Category:    normalizeReportType(category),
 		DateRange:   normalizeDateRange(dateRange),
 		Format:      normalizeReportFormat(format),
-		GeneratedOn: generated.Format("2006-01-02"),
+		GeneratedOn: s.formatISODate(generated),
 		Summary:     map[string]any{},
 		Records:     make([]map[string]any, 0),
 	}
@@ -154,10 +155,10 @@ func (s *Server) buildReportContent(ctx context.Context, id int64, title string,
 				return c, err
 			}
 			c.Records = append(c.Records, map[string]any{
-				"date":        d.Format("2006-01-02"),
-				"animalTagId": tagID,
-				"action":      action,
-				"treatment":   treatment,
+				"date":         s.formatISODate(d),
+				"animalTagId":  tagID,
+				"action":       action,
+				"treatment":    treatment,
 				"veterinarian": vet,
 			})
 		}
@@ -194,7 +195,7 @@ func (s *Server) buildReportContent(ctx context.Context, id int64, title string,
 				return c, err
 			}
 			c.Records = append(c.Records, map[string]any{
-				"date":       d.Format("2006-01-02"),
+				"date":       s.formatISODate(d),
 				"milkLiters": milkLiters,
 				"eggsCount":  eggsCount,
 				"woolKg":     woolKg,
@@ -203,18 +204,21 @@ func (s *Server) buildReportContent(ctx context.Context, id int64, title string,
 		}
 
 	case "Sales":
-		var revenue float64
+		var grossRevenue, netRevenue, vatCollected float64
 		var transactions int64
 		_ = s.db.QueryRow(ctx, `
-			SELECT COALESCE(SUM(total_amount), 0), COUNT(*)
+			SELECT COALESCE(SUM(total_amount), 0), COALESCE(SUM(net_amount), 0), COALESCE(SUM(vat_amount), 0), COUNT(*)
 			FROM sales
 			WHERE sale_date BETWEEN $1 AND $2
-		`, start.Format("2006-01-02"), end.Format("2006-01-02")).Scan(&revenue, &transactions)
-		c.Summary["totalRevenue"] = revenue
+		`, start.Format("2006-01-02"), end.Format("2006-01-02")).Scan(&grossRevenue, &netRevenue, &vatCollected, &transactions)
+		c.Summary["totalRevenue"] = grossRevenue
+		c.Summary["grossRevenue"] = grossRevenue
+		c.Summary["netRevenue"] = netRevenue
+		c.Summary["vatCollected"] = vatCollected
 		c.Summary["transactions"] = transactions
 
 		rows, err := s.db.Query(ctx, `
-			SELECT sale_date, product, quantity_value, quantity_unit, buyer, price_per_unit, total_amount
+			SELECT sale_date, product, quantity_value, quantity_unit, buyer, buyer_pin, vat_applicable, vat_rate, vat_amount, net_amount, price_per_unit, total_amount
 			FROM sales
 			WHERE sale_date BETWEEN $1 AND $2
 			ORDER BY sale_date DESC, id DESC
@@ -226,37 +230,46 @@ func (s *Server) buildReportContent(ctx context.Context, id int64, title string,
 		defer rows.Close()
 		for rows.Next() {
 			var d time.Time
-			var product, unit, buyer string
-			var qty, price, total float64
-			if err := rows.Scan(&d, &product, &qty, &unit, &buyer, &price, &total); err != nil {
+			var product, unit, buyer, buyerPIN string
+			var qty, price, total, vatRate, vatAmount, netAmount float64
+			var vatApplicable bool
+			if err := rows.Scan(&d, &product, &qty, &unit, &buyer, &buyerPIN, &vatApplicable, &vatRate, &vatAmount, &netAmount, &price, &total); err != nil {
 				return c, err
 			}
 			c.Records = append(c.Records, map[string]any{
-				"date":         d.Format("2006-01-02"),
-				"product":      product,
+				"date":          s.formatISODate(d),
+				"product":       product,
 				"quantityValue": qty,
-				"quantityUnit": unit,
-				"buyer":        buyer,
-				"pricePerUnit": price,
-				"totalAmount":  total,
+				"quantityUnit":  unit,
+				"buyer":         buyer,
+				"buyerPIN":      buyerPIN,
+				"vatApplicable": vatApplicable,
+				"vatRate":       vatRate,
+				"vatAmount":     vatAmount,
+				"netAmount":     netAmount,
+				"pricePerUnit":  price,
+				"totalAmount":   total,
 			})
 		}
 
 	default:
-		var revenue, expense float64
+		var grossRevenue, netRevenue, vatCollected, expense float64
 		_ = s.db.QueryRow(ctx, `
-			SELECT COALESCE(SUM(total_amount), 0)
+			SELECT COALESCE(SUM(total_amount), 0), COALESCE(SUM(net_amount), 0), COALESCE(SUM(vat_amount), 0)
 			FROM sales
 			WHERE sale_date BETWEEN $1 AND $2
-		`, start.Format("2006-01-02"), end.Format("2006-01-02")).Scan(&revenue)
+		`, start.Format("2006-01-02"), end.Format("2006-01-02")).Scan(&grossRevenue, &netRevenue, &vatCollected)
 		_ = s.db.QueryRow(ctx, `
 			SELECT COALESCE(SUM(amount), 0)
 			FROM expenses
 			WHERE expense_date BETWEEN $1 AND $2
 		`, start.Format("2006-01-02"), end.Format("2006-01-02")).Scan(&expense)
-		c.Summary["totalRevenue"] = revenue
+		c.Summary["totalRevenue"] = grossRevenue
+		c.Summary["grossRevenue"] = grossRevenue
+		c.Summary["netRevenue"] = netRevenue
+		c.Summary["vatCollected"] = vatCollected
 		c.Summary["totalExpenses"] = expense
-		c.Summary["profit"] = revenue - expense
+		c.Summary["profit"] = netRevenue - expense
 
 		rows, err := s.db.Query(ctx, `
 			SELECT entry_date, entry_type, item, amount
@@ -284,7 +297,7 @@ func (s *Server) buildReportContent(ctx context.Context, id int64, title string,
 				return c, err
 			}
 			c.Records = append(c.Records, map[string]any{
-				"date":   d.Format("2006-01-02"),
+				"date":   s.formatISODate(d),
 				"type":   kind,
 				"item":   item,
 				"amount": amount,
@@ -305,46 +318,20 @@ func writePDFReport(w http.ResponseWriter, report reportContent) error {
 	}
 	sort.Strings(summaryKeys)
 	summaryLines := make([]string, 0, len(summaryKeys))
-	for _, k := range summaryKeys {
-		summaryLines = append(summaryLines, fmt.Sprintf("%s: %v", k, report.Summary[k]))
+	for _, k := range orderedReportSummaryKeys(report.Category, summaryKeys) {
+		summaryLines = append(summaryLines, fmt.Sprintf("%s: %s", prettyMetricLabel(k), formatSummaryValue(k, report.Summary[k])))
 	}
 	if len(summaryLines) == 0 {
 		summaryLines = append(summaryLines, "No summary metrics available.")
 	}
 
-	recordLines := make([]string, 0)
-	if len(report.Records) == 0 {
-		recordLines = append(recordLines, "No records available in this range.")
-	}
-
-	maxRecords := len(report.Records)
-	if maxRecords > 12 {
-		maxRecords = 12
-	}
-	for i := 0; i < maxRecords; i++ {
-		record := report.Records[i]
-		recordKeys := make([]string, 0, len(record))
-		for k := range record {
-			recordKeys = append(recordKeys, k)
-		}
-		sort.Strings(recordKeys)
-
-		parts := make([]string, 0, len(recordKeys))
-		for _, k := range recordKeys {
-			parts = append(parts, fmt.Sprintf("%s=%v", k, record[k]))
-		}
-		recordLines = append(recordLines, fmt.Sprintf("%d) %s", i+1, strings.Join(parts, " | ")))
-	}
-	if len(report.Records) > maxRecords {
-		recordLines = append(recordLines, fmt.Sprintf("... %d more records not shown", len(report.Records)-maxRecords))
-	}
-
-	pdf := buildStyledPDF(report, summaryLines, recordLines)
+	recordHeaders, recordRows, overflowNote := buildRecordHighlights(report)
+	pdf := buildStyledPDF(report, summaryLines, recordHeaders, recordRows, overflowNote)
 	_, err := w.Write(pdf)
 	return err
 }
 
-func buildStyledPDF(report reportContent, summaryLines []string, recordLines []string) []byte {
+func buildStyledPDF(report reportContent, summaryLines []string, recordHeaders []string, recordRows [][]string, overflowNote string) []byte {
 	accentR, accentG, accentB := categoryTheme(report.Category)
 
 	var stream bytes.Buffer
@@ -402,7 +389,7 @@ func buildStyledPDF(report reportContent, summaryLines []string, recordLines []s
 		stream.WriteString("0.86 0.84 0.79 RG 0.8 w ")
 		stream.WriteString(fmt.Sprintf("%d %d %d 30 re S\n", x, yy, cardW))
 		stream.WriteString("0.30 0.32 0.30 rg BT /F1 8 Tf ")
-		stream.WriteString(fmt.Sprintf("%d %d Td (%s) Tj ET\n", x+8, yy+18, pdfEscape(shortenPDFText(strings.ToUpper(key), 26))))
+		stream.WriteString(fmt.Sprintf("%d %d Td (%s) Tj ET\n", x+8, yy+18, pdfEscape(shortenPDFText(key, 26))))
 		stream.WriteString(fmt.Sprintf("%.2f %.2f %.2f rg BT /F2 10 Tf ", accentR*0.9, accentG*0.9, accentB*0.9))
 		stream.WriteString(fmt.Sprintf("%d %d Td (%s) Tj ET\n", x+8, yy+7, pdfEscape(shortenPDFText(value, 24))))
 		cardIdx++
@@ -416,14 +403,24 @@ func buildStyledPDF(report reportContent, summaryLines []string, recordLines []s
 	stream.WriteString(fmt.Sprintf("%.2f %.2f %.2f rg 36 442 523 8 re f\n", accentR, accentG, accentB))
 	stream.WriteString("0.18 0.20 0.18 rg BT /F2 13 Tf 50 430 Td (Record Highlights) Tj ET\n")
 
-	stream.WriteString("0.94 0.94 0.92 rg 50 406 496 20 re f\n")
-	stream.WriteString("0.30 0.32 0.30 rg BT /F2 9 Tf 58 412 Td (Index) Tj ET\n")
-	stream.WriteString("0.30 0.32 0.30 rg BT /F2 9 Tf 100 412 Td (Details) Tj ET\n")
+	if len(recordHeaders) == 0 {
+		recordHeaders = []string{"#", "Details"}
+	}
+	columnWidths := highlightColumnWidths(report.Category, len(recordHeaders))
+	headerY := 406
+	stream.WriteString(fmt.Sprintf("0.94 0.94 0.92 rg 50 %d 496 20 re f\n", headerY))
+	stream.WriteString("0.30 0.32 0.30 rg ")
+	x := 58
+	for i, h := range recordHeaders {
+		stream.WriteString(fmt.Sprintf("BT /F2 8 Tf %d %d Td (%s) Tj ET\n", x, headerY+6, pdfEscape(shortenPDFText(h, 22))))
+		if i < len(columnWidths) {
+			x += columnWidths[i]
+		}
+	}
 
 	y = 390
 	rowH := 22
-	rowIdx := 0
-	for _, line := range recordLines {
+	for rowIdx, row := range recordRows {
 		if y < 70 {
 			break
 		}
@@ -436,22 +433,23 @@ func buildStyledPDF(report reportContent, summaryLines []string, recordLines []s
 		stream.WriteString("0.88 0.86 0.82 RG 0.3 w ")
 		stream.WriteString(fmt.Sprintf("50 %d 496 %d re S\n", y-4, rowH))
 
-		indexText := fmt.Sprintf("%d", rowIdx+1)
-		detailText := line
-		if strings.Contains(line, ") ") {
-			parts := strings.SplitN(line, ") ", 2)
-			if len(parts) == 2 {
-				indexText = parts[0]
-				detailText = parts[1]
+		x = 58
+		for i, cell := range row {
+			width := 92
+			if i < len(columnWidths) {
+				width = columnWidths[i]
 			}
+			maxChars := intMax(6, (width-10)/4)
+			stream.WriteString("0.24 0.26 0.24 rg BT /F1 7 Tf ")
+			stream.WriteString(fmt.Sprintf("%d %d Td (%s) Tj ET\n", x, y+5, pdfEscape(shortenPDFText(cell, maxChars))))
+			x += width
 		}
-
-		stream.WriteString(fmt.Sprintf("%.2f %.2f %.2f rg BT /F2 9 Tf 58 %d Td (%s) Tj ET\n", accentR*0.85, accentG*0.85, accentB*0.85, y+5, pdfEscape(shortenPDFText(indexText, 8))))
-		stream.WriteString("0.24 0.26 0.24 rg BT /F1 8 Tf ")
-		stream.WriteString(fmt.Sprintf("100 %d Td (%s) Tj ET\n", y+5, pdfEscape(shortenPDFText(detailText, 96))))
-
 		y -= rowH
-		rowIdx++
+	}
+	if overflowNote != "" {
+		stream.WriteString("0.30 0.32 0.30 rg BT /F1 8 Tf 58 60 Td (")
+		stream.WriteString(pdfEscape(overflowNote))
+		stream.WriteString(") Tj ET\n")
 	}
 
 	stream.WriteString(fmt.Sprintf("%.2f %.2f %.2f rg 0 0 595 28 re f\n", accentR*0.9, accentG*0.9, accentB*0.9))
@@ -544,6 +542,288 @@ func shortenPDFText(s string, max int) string {
 		return v
 	}
 	return v[:max-3] + "..."
+}
+
+func orderedReportSummaryKeys(category string, summaryKeys []string) []string {
+	priorityByCategory := map[string][]string{
+		"financial": {"grossRevenue", "netRevenue", "profit", "totalExpenses", "totalRevenue", "vatCollected"},
+		"sales":     {"grossRevenue", "netRevenue", "totalRevenue", "vatCollected", "transactions"},
+		"resources": {"totalValue", "milkLiters", "eggsCount", "woolKg"},
+		"health":    {"healthy", "attention", "sick"},
+	}
+	priority := priorityByCategory[strings.ToLower(strings.TrimSpace(category))]
+	if len(priority) == 0 {
+		return summaryKeys
+	}
+
+	seen := make(map[string]struct{}, len(summaryKeys))
+	out := make([]string, 0, len(summaryKeys))
+	for _, k := range summaryKeys {
+		seen[k] = struct{}{}
+	}
+	for _, k := range priority {
+		if _, ok := seen[k]; ok {
+			out = append(out, k)
+			delete(seen, k)
+		}
+	}
+	for _, k := range summaryKeys {
+		if _, ok := seen[k]; ok {
+			out = append(out, k)
+			delete(seen, k)
+		}
+	}
+	return out
+}
+
+func prettyMetricLabel(raw string) string {
+	known := map[string]string{
+		"grossRevenue":  "Gross Revenue",
+		"netRevenue":    "Net Revenue",
+		"profit":        "Profit",
+		"totalExpenses": "Total Expenses",
+		"totalRevenue":  "Total Revenue",
+		"vatCollected":  "VAT Collected",
+		"transactions":  "Transactions",
+		"milkLiters":    "Milk (Liters)",
+		"eggsCount":     "Eggs Count",
+		"woolKg":        "Wool (Kg)",
+		"totalValue":    "Total Value",
+		"healthy":       "Healthy Animals",
+		"attention":     "Needs Attention",
+		"sick":          "Sick Animals",
+	}
+	if v, ok := known[raw]; ok {
+		return v
+	}
+	if raw == "" {
+		return "Metric"
+	}
+	return raw
+}
+
+func formatSummaryValue(key string, value any) string {
+	switch strings.ToLower(strings.TrimSpace(key)) {
+	case "grossrevenue", "netrevenue", "profit", "totalexpenses", "totalrevenue", "vatcollected", "totalvalue":
+		return formatAnyCurrency(value)
+	case "transactions", "healthy", "attention", "sick", "eggscount":
+		if n, ok := asFloat64(value); ok {
+			return fmt.Sprintf("%d", int64(math.Round(n)))
+		}
+		return fmt.Sprint(value)
+	case "milkliters", "woolkg":
+		return formatAnyNumber(value)
+	default:
+		if n, ok := asFloat64(value); ok {
+			return trimZero(n)
+		}
+		return fmt.Sprint(value)
+	}
+}
+
+func buildRecordHighlights(report reportContent) ([]string, [][]string, string) {
+	rows := make([][]string, 0)
+	if len(report.Records) == 0 {
+		return []string{"#", "Details"}, [][]string{{"1", "No records available in this range."}}, ""
+	}
+
+	headersByCategory := map[string][]string{
+		"financial": {"#", "Date", "Type", "Item", "Amount"},
+		"sales":     {"#", "Date", "Product", "Qty", "Buyer", "Total"},
+		"resources": {"#", "Date", "Milk (L)", "Eggs", "Wool (Kg)", "Value"},
+		"health":    {"#", "Date", "Tag", "Action", "Treatment", "Vet"},
+	}
+	category := strings.ToLower(strings.TrimSpace(report.Category))
+	headers := headersByCategory[category]
+	if len(headers) == 0 {
+		headers = []string{"#", "Details"}
+	}
+
+	maxRows := len(report.Records)
+	if maxRows > 12 {
+		maxRows = 12
+	}
+	for i := 0; i < maxRows; i++ {
+		r := report.Records[i]
+		switch category {
+		case "financial":
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", i+1),
+				fmt.Sprint(r["date"]),
+				titleWord(fmt.Sprint(r["type"])),
+				fmt.Sprint(r["item"]),
+				formatAnyCurrency(r["amount"]),
+			})
+		case "sales":
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", i+1),
+				fmt.Sprint(r["date"]),
+				fmt.Sprint(r["product"]),
+				strings.TrimSpace(fmt.Sprintf("%s %s", formatAnyNumber(r["quantityValue"]), fmt.Sprint(r["quantityUnit"]))),
+				fmt.Sprint(r["buyer"]),
+				formatAnyCurrency(r["totalAmount"]),
+			})
+		case "resources":
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", i+1),
+				fmt.Sprint(r["date"]),
+				formatAnyNumber(r["milkLiters"]),
+				formatAnyNumber(r["eggsCount"]),
+				formatAnyNumber(r["woolKg"]),
+				formatAnyCurrency(r["totalValue"]),
+			})
+		case "health":
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", i+1),
+				fmt.Sprint(r["date"]),
+				fmt.Sprint(r["animalTagId"]),
+				fmt.Sprint(r["action"]),
+				fmt.Sprint(r["treatment"]),
+				fmt.Sprint(r["veterinarian"]),
+			})
+		default:
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", i+1),
+				formatRecordHighlight(report.Category, r),
+			})
+		}
+	}
+
+	overflow := ""
+	if len(report.Records) > maxRows {
+		overflow = fmt.Sprintf("%d additional records not shown.", len(report.Records)-maxRows)
+	}
+	return headers, rows, overflow
+}
+
+func highlightColumnWidths(category string, headerCount int) []int {
+	switch strings.ToLower(strings.TrimSpace(category)) {
+	case "financial":
+		return []int{26, 82, 62, 218, 96}
+	case "sales":
+		return []int{24, 70, 118, 72, 134, 78}
+	case "resources":
+		return []int{24, 70, 88, 64, 88, 86}
+	case "health":
+		return []int{24, 66, 64, 88, 142, 112}
+	default:
+		if headerCount <= 2 {
+			return []int{24, 472}
+		}
+		widths := make([]int, headerCount)
+		widths[0] = 24
+		remaining := 472
+		if headerCount > 1 {
+			each := remaining / (headerCount - 1)
+			for i := 1; i < headerCount; i++ {
+				widths[i] = each
+			}
+		}
+		return widths
+	}
+}
+
+func formatRecordHighlight(category string, record map[string]any) string {
+	switch strings.ToLower(strings.TrimSpace(category)) {
+	case "financial":
+		date := fmt.Sprint(record["date"])
+		item := fmt.Sprint(record["item"])
+		kind := titleWord(fmt.Sprint(record["type"]))
+		amount := formatAnyCurrency(record["amount"])
+		return fmt.Sprintf("%s | %s | %s | %s", date, kind, item, amount)
+	case "sales":
+		date := fmt.Sprint(record["date"])
+		product := fmt.Sprint(record["product"])
+		buyer := fmt.Sprint(record["buyer"])
+		qty := strings.TrimSpace(fmt.Sprintf("%s %s", formatAnyNumber(record["quantityValue"]), fmt.Sprint(record["quantityUnit"])))
+		total := formatAnyCurrency(record["totalAmount"])
+		return fmt.Sprintf("%s | %s | %s | %s | %s", date, product, qty, buyer, total)
+	case "resources":
+		date := fmt.Sprint(record["date"])
+		milk := formatAnyNumber(record["milkLiters"])
+		eggs := formatAnyNumber(record["eggsCount"])
+		wool := formatAnyNumber(record["woolKg"])
+		total := formatAnyCurrency(record["totalValue"])
+		return fmt.Sprintf("%s | Milk %s L | Eggs %s | Wool %s Kg | %s", date, milk, eggs, wool, total)
+	case "health":
+		date := fmt.Sprint(record["date"])
+		tag := fmt.Sprint(record["animalTagId"])
+		action := fmt.Sprint(record["action"])
+		treatment := fmt.Sprint(record["treatment"])
+		vet := fmt.Sprint(record["veterinarian"])
+		return fmt.Sprintf("%s | Tag %s | %s | %s | Vet: %s", date, tag, action, treatment, vet)
+	default:
+		keys := make([]string, 0, len(record))
+		for k := range record {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, k := range keys {
+			parts = append(parts, fmt.Sprintf("%s=%v", k, record[k]))
+		}
+		return strings.Join(parts, " | ")
+	}
+}
+
+func titleWord(v string) string {
+	s := strings.ToLower(strings.TrimSpace(v))
+	if s == "" {
+		return ""
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+func asFloat64(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int8:
+		return float64(n), true
+	case int16:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case uint:
+		return float64(n), true
+	case uint8:
+		return float64(n), true
+	case uint16:
+		return float64(n), true
+	case uint32:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	default:
+		return 0, false
+	}
+}
+
+func formatAnyCurrency(v any) string {
+	if n, ok := asFloat64(v); ok {
+		return formatKES(n)
+	}
+	return fmt.Sprint(v)
+}
+
+func formatAnyNumber(v any) string {
+	if n, ok := asFloat64(v); ok {
+		return trimZero(n)
+	}
+	return fmt.Sprint(v)
+}
+
+func intMax(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func pdfEscape(s string) string {

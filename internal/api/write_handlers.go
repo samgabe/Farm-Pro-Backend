@@ -27,7 +27,12 @@ func (s *Server) handleCreateAnimal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	in.TagID = strings.ToUpper(strings.TrimSpace(in.TagID))
+	normalizedTag, ok := normalizeAnimalTag(in.TagID)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "tagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+		return
+	}
+	in.TagID = normalizedTag
 	in.Type = strings.TrimSpace(in.Type)
 	in.Breed = strings.TrimSpace(in.Breed)
 	if in.HealthStatus == "" {
@@ -47,6 +52,10 @@ func (s *Server) handleCreateAnimal(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "birthDate must be YYYY-MM-DD"})
 		return
 	}
+	if birthDate != nil && birthDate.After(time.Now()) {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "birthDate cannot be in the future"})
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -54,7 +63,7 @@ func (s *Server) handleCreateAnimal(w http.ResponseWriter, r *http.Request) {
 	_, err = s.db.Exec(ctx, `
 		INSERT INTO animals(tag_id, type, breed, birth_date, weight_kg, health_status, status, is_active)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`, in.TagID, in.Type, in.Breed, birthDate, in.WeightKg, in.HealthStatus, in.Status, in.Status != "sold")
+	`, in.TagID, in.Type, in.Breed, birthDate, in.WeightKg, in.HealthStatus, in.Status, in.Status == "active")
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "duplicate key") {
 			respondJSON(w, http.StatusConflict, map[string]string{"error": "tag ID already exists"})
@@ -68,8 +77,8 @@ func (s *Server) handleCreateAnimal(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdateAnimal(w http.ResponseWriter, r *http.Request) {
-	tagID := strings.ToUpper(strings.TrimSpace(r.PathValue("tagId")))
-	if tagID == "" {
+	tagID, ok := normalizeAnimalTag(r.PathValue("tagId"))
+	if !ok {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid tag ID"})
 		return
 	}
@@ -104,6 +113,10 @@ func (s *Server) handleUpdateAnimal(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "birthDate must be YYYY-MM-DD"})
 		return
 	}
+	if birthDate != nil && birthDate.After(time.Now()) {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "birthDate cannot be in the future"})
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -125,8 +138,8 @@ func (s *Server) handleUpdateAnimal(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteAnimal(w http.ResponseWriter, r *http.Request) {
-	tagID := strings.ToUpper(strings.TrimSpace(r.PathValue("tagId")))
-	if tagID == "" {
+	tagID, ok := normalizeAnimalTag(r.PathValue("tagId"))
+	if !ok {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid tag ID"})
 		return
 	}
@@ -164,7 +177,12 @@ func (s *Server) handleCreateHealthRecord(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	in.AnimalTagID = strings.ToUpper(strings.TrimSpace(in.AnimalTagID))
+	tagID, ok := normalizeAnimalTag(in.AnimalTagID)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "animalTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+		return
+	}
+	in.AnimalTagID = tagID
 	in.Action = strings.TrimSpace(in.Action)
 	in.Treatment = strings.TrimSpace(in.Treatment)
 	in.Veterinarian = strings.TrimSpace(in.Veterinarian)
@@ -230,7 +248,12 @@ func (s *Server) handleUpdateHealthRecord(w http.ResponseWriter, r *http.Request
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
 		return
 	}
-	in.AnimalTagID = strings.ToUpper(strings.TrimSpace(in.AnimalTagID))
+	tagID, ok := normalizeAnimalTag(in.AnimalTagID)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "animalTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+		return
+	}
+	in.AnimalTagID = tagID
 	in.Action = strings.TrimSpace(in.Action)
 	in.Treatment = strings.TrimSpace(in.Treatment)
 	in.Veterinarian = strings.TrimSpace(in.Veterinarian)
@@ -307,8 +330,22 @@ func (s *Server) handleCreateBreedingRecord(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	in.MotherTagID = strings.ToUpper(strings.TrimSpace(in.MotherTagID))
-	in.FatherTagID = strings.ToUpper(strings.TrimSpace(in.FatherTagID))
+	motherTag, ok := normalizeAnimalTag(in.MotherTagID)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+		return
+	}
+	fatherTag, ok := normalizeAnimalTag(in.FatherTagID)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "fatherTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+		return
+	}
+	if motherTag == fatherTag {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId and fatherTagId must be different"})
+		return
+	}
+	in.MotherTagID = motherTag
+	in.FatherTagID = fatherTag
 	in.Species = strings.TrimSpace(in.Species)
 	in.Notes = strings.TrimSpace(in.Notes)
 	if in.BreedingDate == "" {
@@ -375,8 +412,22 @@ func (s *Server) handleUpdateBreedingRecord(w http.ResponseWriter, r *http.Reque
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
 		return
 	}
-	in.MotherTagID = strings.ToUpper(strings.TrimSpace(in.MotherTagID))
-	in.FatherTagID = strings.ToUpper(strings.TrimSpace(in.FatherTagID))
+	motherTag, ok := normalizeAnimalTag(in.MotherTagID)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+		return
+	}
+	fatherTag, ok := normalizeAnimalTag(in.FatherTagID)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "fatherTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+		return
+	}
+	if motherTag == fatherTag {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId and fatherTagId must be different"})
+		return
+	}
+	in.MotherTagID = motherTag
+	in.FatherTagID = fatherTag
 	in.Species = strings.TrimSpace(in.Species)
 	if in.Status == "" {
 		in.Status = "active"
@@ -443,13 +494,78 @@ func (s *Server) handleDeleteBreedingRecord(w http.ResponseWriter, r *http.Reque
 	respondJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (s *Server) handleCreateProductionLog(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRecordBirth(w http.ResponseWriter, r *http.Request) {
+	recordID, err := parsePathID(r, "id")
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid record id"})
+		return
+	}
+
 	var in struct {
-		Date      string   `json:"date"`
-		MilkLiters *float64 `json:"milkLiters"`
-		EggsCount *float64 `json:"eggsCount"`
-		WoolKg    *float64 `json:"woolKg"`
-		TotalValue *float64 `json:"totalValue"`
+		ActualBirthDate string `json:"actualBirthDate"`
+		OffspringCount  *int   `json:"offspringCount"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
+		return
+	}
+
+	in.ActualBirthDate = strings.TrimSpace(in.ActualBirthDate)
+	if in.ActualBirthDate == "" {
+		in.ActualBirthDate = time.Now().Format("2006-01-02")
+	}
+	actualBirthDate, err := time.Parse("2006-01-02", in.ActualBirthDate)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "actualBirthDate must be YYYY-MM-DD"})
+		return
+	}
+
+	offspringCount := 0
+	if in.OffspringCount != nil {
+		offspringCount = *in.OffspringCount
+	}
+	if offspringCount < 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "offspringCount cannot be negative"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	res, err := s.db.Exec(ctx, `
+		UPDATE breeding_records
+		SET actual_birth_date = $1, offspring_count = $2, status = 'completed'
+		WHERE id = $3
+	`, actualBirthDate, offspringCount, recordID)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to record birth"})
+		return
+	}
+	if res.RowsAffected() == 0 {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "record not found"})
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleCreateProductionLog(w http.ResponseWriter, r *http.Request) {
+	const (
+		defaultMilkRate = 60.0
+		defaultEggRate  = 15.0
+		defaultWoolRate = 500.0
+	)
+
+	var in struct {
+		Date                string   `json:"date"`
+		MilkLiters          *float64 `json:"milkLiters"`
+		EggsCount           *int     `json:"eggsCount"`
+		WoolKg              *float64 `json:"woolKg"`
+		MilkRate            *float64 `json:"milkRate"`
+		EggRate             *float64 `json:"eggRate"`
+		WoolRate            *float64 `json:"woolRate"`
+		TotalValue          *float64 `json:"totalValue"`
+		ManualTotalOverride bool     `json:"manualTotalOverride"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
@@ -464,8 +580,11 @@ func (s *Server) handleCreateProductionLog(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	milk := 0.0
-	eggs := 0.0
+	eggs := 0
 	wool := 0.0
+	milkRate := defaultMilkRate
+	eggRate := defaultEggRate
+	woolRate := defaultWoolRate
 	totalValue := 0.0
 	if in.MilkLiters != nil {
 		milk = *in.MilkLiters
@@ -476,13 +595,29 @@ func (s *Server) handleCreateProductionLog(w http.ResponseWriter, r *http.Reques
 	if in.WoolKg != nil {
 		wool = *in.WoolKg
 	}
-	if in.TotalValue != nil {
-		totalValue = *in.TotalValue
+	if in.MilkRate != nil {
+		milkRate = *in.MilkRate
 	}
-	if milk < 0 || eggs < 0 || wool < 0 || totalValue < 0 {
+	if in.EggRate != nil {
+		eggRate = *in.EggRate
+	}
+	if in.WoolRate != nil {
+		woolRate = *in.WoolRate
+	}
+	if milk < 0 || eggs < 0 || wool < 0 || milkRate < 0 || eggRate < 0 || woolRate < 0 {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "production values cannot be negative"})
 		return
 	}
+	if in.ManualTotalOverride {
+		if in.TotalValue == nil || *in.TotalValue < 0 {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "manual totalValue must be provided and non-negative"})
+			return
+		}
+		totalValue = *in.TotalValue
+	} else {
+		totalValue = milk*milkRate + float64(eggs)*eggRate + wool*woolRate
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	_, err = s.db.Exec(ctx, `
@@ -493,7 +628,7 @@ func (s *Server) handleCreateProductionLog(w http.ResponseWriter, r *http.Reques
 			eggs_count = EXCLUDED.eggs_count,
 			wool_kg = EXCLUDED.wool_kg,
 			total_value = EXCLUDED.total_value
-	`, d, milk, int(eggs), wool, totalValue)
+	`, d, milk, eggs, wool, totalValue)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create production log"})
 		return
@@ -502,17 +637,27 @@ func (s *Server) handleCreateProductionLog(w http.ResponseWriter, r *http.Reques
 }
 
 func (s *Server) handleUpdateProductionLog(w http.ResponseWriter, r *http.Request) {
+	const (
+		defaultMilkRate = 60.0
+		defaultEggRate  = 15.0
+		defaultWoolRate = 500.0
+	)
+
 	logID, err := parsePathID(r, "id")
 	if err != nil {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid log id"})
 		return
 	}
 	var in struct {
-		Date       string  `json:"date"`
-		MilkLiters float64 `json:"milkLiters"`
-		EggsCount  float64 `json:"eggsCount"`
-		WoolKg     float64 `json:"woolKg"`
-		TotalValue float64 `json:"totalValue"`
+		Date                string   `json:"date"`
+		MilkLiters          float64  `json:"milkLiters"`
+		EggsCount           int      `json:"eggsCount"`
+		WoolKg              float64  `json:"woolKg"`
+		MilkRate            *float64 `json:"milkRate"`
+		EggRate             *float64 `json:"eggRate"`
+		WoolRate            *float64 `json:"woolRate"`
+		TotalValue          float64  `json:"totalValue"`
+		ManualTotalOverride bool     `json:"manualTotalOverride"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
@@ -523,9 +668,30 @@ func (s *Server) handleUpdateProductionLog(w http.ResponseWriter, r *http.Reques
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "date must be YYYY-MM-DD"})
 		return
 	}
-	if in.MilkLiters < 0 || in.EggsCount < 0 || in.WoolKg < 0 || in.TotalValue < 0 {
+	milkRate := defaultMilkRate
+	eggRate := defaultEggRate
+	woolRate := defaultWoolRate
+	if in.MilkRate != nil {
+		milkRate = *in.MilkRate
+	}
+	if in.EggRate != nil {
+		eggRate = *in.EggRate
+	}
+	if in.WoolRate != nil {
+		woolRate = *in.WoolRate
+	}
+	if in.MilkLiters < 0 || in.EggsCount < 0 || in.WoolKg < 0 || milkRate < 0 || eggRate < 0 || woolRate < 0 {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "production values cannot be negative"})
 		return
+	}
+	totalValue := in.TotalValue
+	if in.ManualTotalOverride {
+		if in.TotalValue < 0 {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "manual totalValue must be non-negative"})
+			return
+		}
+	} else {
+		totalValue = in.MilkLiters*milkRate + float64(in.EggsCount)*eggRate + in.WoolKg*woolRate
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -533,7 +699,7 @@ func (s *Server) handleUpdateProductionLog(w http.ResponseWriter, r *http.Reques
 		UPDATE production_logs
 		SET log_date = $1, milk_liters = $2, eggs_count = $3, wool_kg = $4, total_value = $5
 		WHERE id = $6
-	`, d, in.MilkLiters, int(in.EggsCount), in.WoolKg, in.TotalValue, logID)
+	`, d, in.MilkLiters, in.EggsCount, in.WoolKg, totalValue, logID)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update production log"})
 		return
@@ -676,13 +842,18 @@ func (s *Server) handleDeleteExpense(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateSale(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Date          string   `json:"date"`
-		Product       string   `json:"product"`
-		QuantityValue float64  `json:"quantityValue"`
-		QuantityUnit  string   `json:"quantityUnit"`
-		Buyer         string   `json:"buyer"`
-		PricePerUnit  float64  `json:"pricePerUnit"`
-		TotalAmount   *float64 `json:"totalAmount"`
+		Date              string   `json:"date"`
+		Product           string   `json:"product"`
+		QuantityValue     float64  `json:"quantityValue"`
+		QuantityUnit      string   `json:"quantityUnit"`
+		Buyer             string   `json:"buyer"`
+		BuyerPIN          string   `json:"buyerPIN"`
+		DeliveryCounty    string   `json:"deliveryCounty"`
+		DeliverySubcounty string   `json:"deliverySubcounty"`
+		VATApplicable     bool     `json:"vatApplicable"`
+		VATRate           *float64 `json:"vatRate"`
+		PricePerUnit      float64  `json:"pricePerUnit"`
+		TotalAmount       *float64 `json:"totalAmount"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
@@ -692,6 +863,9 @@ func (s *Server) handleCreateSale(w http.ResponseWriter, r *http.Request) {
 	in.Product = strings.TrimSpace(in.Product)
 	in.QuantityUnit = strings.TrimSpace(in.QuantityUnit)
 	in.Buyer = strings.TrimSpace(in.Buyer)
+	in.BuyerPIN = strings.TrimSpace(in.BuyerPIN)
+	in.DeliveryCounty = strings.TrimSpace(in.DeliveryCounty)
+	in.DeliverySubcounty = strings.TrimSpace(in.DeliverySubcounty)
 	if in.Date == "" {
 		in.Date = time.Now().Format("2006-01-02")
 	}
@@ -706,18 +880,54 @@ func (s *Server) handleCreateSale(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	buyerPIN, ok := normalizeKRAPIN(in.BuyerPIN)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "buyer PIN must be valid KRA format (e.g. A012345678Z)"})
+		return
+	}
+	county, ok := normalizeCounty(in.DeliveryCounty)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "delivery county must be a valid Kenya county"})
+		return
+	}
+	if in.DeliverySubcounty != "" && county == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "delivery county is required when subcounty is provided"})
+		return
+	}
+
 	total := in.QuantityValue * in.PricePerUnit
 	if in.TotalAmount != nil && *in.TotalAmount > 0 {
 		total = *in.TotalAmount
+	}
+	vatRate := 0.0
+	if in.VATApplicable {
+		vatRate = 0.16
+		if in.VATRate != nil {
+			vatRate = *in.VATRate
+		}
+		if vatRate < 0 || vatRate > 1 {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "vatRate must be between 0 and 1"})
+			return
+		}
+	}
+	netAmount := total
+	vatAmount := 0.0
+	if in.VATApplicable && vatRate > 0 {
+		netAmount = total / (1 + vatRate)
+		vatAmount = total - netAmount
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
 	_, err = s.db.Exec(ctx, `
-		INSERT INTO sales(sale_date, product, quantity_value, quantity_unit, buyer, price_per_unit, total_amount)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`, d, in.Product, in.QuantityValue, in.QuantityUnit, in.Buyer, in.PricePerUnit, total)
+		INSERT INTO sales(
+			sale_date, product, quantity_value, quantity_unit, buyer, buyer_pin,
+			delivery_county, delivery_subcounty, vat_applicable, vat_rate, vat_amount, net_amount,
+			price_per_unit, total_amount
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+	`, d, in.Product, in.QuantityValue, in.QuantityUnit, in.Buyer, buyerPIN, county, in.DeliverySubcounty, in.VATApplicable, vatRate, vatAmount, netAmount, in.PricePerUnit, total)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create sale"})
 		return
@@ -733,12 +943,17 @@ func (s *Server) handleUpdateSale(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Date          string  `json:"date"`
-		Product       string  `json:"product"`
-		QuantityValue float64 `json:"quantityValue"`
-		QuantityUnit  string  `json:"quantityUnit"`
-		Buyer         string  `json:"buyer"`
-		PricePerUnit  float64 `json:"pricePerUnit"`
+		Date              string   `json:"date"`
+		Product           string   `json:"product"`
+		QuantityValue     float64  `json:"quantityValue"`
+		QuantityUnit      string   `json:"quantityUnit"`
+		Buyer             string   `json:"buyer"`
+		BuyerPIN          string   `json:"buyerPIN"`
+		DeliveryCounty    string   `json:"deliveryCounty"`
+		DeliverySubcounty string   `json:"deliverySubcounty"`
+		VATApplicable     bool     `json:"vatApplicable"`
+		VATRate           *float64 `json:"vatRate"`
+		PricePerUnit      float64  `json:"pricePerUnit"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
@@ -753,14 +968,48 @@ func (s *Server) handleUpdateSale(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "product, quantity, unit, buyer and price are required"})
 		return
 	}
+	buyerPIN, ok := normalizeKRAPIN(in.BuyerPIN)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "buyer PIN must be valid KRA format (e.g. A012345678Z)"})
+		return
+	}
+	county, ok := normalizeCounty(in.DeliveryCounty)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "delivery county must be a valid Kenya county"})
+		return
+	}
+	subcounty := strings.TrimSpace(in.DeliverySubcounty)
+	if subcounty != "" && county == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "delivery county is required when subcounty is provided"})
+		return
+	}
 	total := in.QuantityValue * in.PricePerUnit
+	vatRate := 0.0
+	if in.VATApplicable {
+		vatRate = 0.16
+		if in.VATRate != nil {
+			vatRate = *in.VATRate
+		}
+		if vatRate < 0 || vatRate > 1 {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "vatRate must be between 0 and 1"})
+			return
+		}
+	}
+	netAmount := total
+	vatAmount := 0.0
+	if in.VATApplicable && vatRate > 0 {
+		netAmount = total / (1 + vatRate)
+		vatAmount = total - netAmount
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	res, err := s.db.Exec(ctx, `
 		UPDATE sales
-		SET sale_date = $1, product = $2, quantity_value = $3, quantity_unit = $4, buyer = $5, price_per_unit = $6, total_amount = $7
-		WHERE id = $8
-	`, d, strings.TrimSpace(in.Product), in.QuantityValue, strings.TrimSpace(in.QuantityUnit), strings.TrimSpace(in.Buyer), in.PricePerUnit, total, saleID)
+		SET sale_date = $1, product = $2, quantity_value = $3, quantity_unit = $4, buyer = $5, buyer_pin = $6,
+			delivery_county = $7, delivery_subcounty = $8, vat_applicable = $9, vat_rate = $10, vat_amount = $11, net_amount = $12,
+			price_per_unit = $13, total_amount = $14
+		WHERE id = $15
+	`, d, strings.TrimSpace(in.Product), in.QuantityValue, strings.TrimSpace(in.QuantityUnit), strings.TrimSpace(in.Buyer), buyerPIN, county, subcounty, in.VATApplicable, vatRate, vatAmount, netAmount, in.PricePerUnit, total, saleID)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update sale"})
 		return
@@ -829,6 +1078,12 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid email format"})
 		return
 	}
+	phone, ok := normalizeKenyaPhone(in.Phone)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "phone must be a valid Kenya number (e.g. +2547XXXXXXXX)"})
+		return
+	}
+	in.Phone = phone
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(in.Password), bcrypt.DefaultCost)
 	if err != nil {
@@ -839,10 +1094,16 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
+	roleID, roleName, err := s.resolveRole(ctx, in.Role)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid role"})
+		return
+	}
+
 	_, err = s.db.Exec(ctx, `
-		INSERT INTO users(name, email, password_hash, role, phone, status)
-		VALUES ($1, $2, $3, $4, $5, $6)
-	`, in.Name, in.Email, string(hash), in.Role, in.Phone, in.Status)
+		INSERT INTO users(name, email, password_hash, role_id, role, phone, status)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+	`, in.Name, in.Email, string(hash), roleID, roleName, in.Phone, in.Status)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "duplicate key") {
 			respondJSON(w, http.StatusConflict, map[string]string{"error": "email already registered"})
@@ -889,9 +1150,21 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid email format"})
 		return
 	}
+	phone, ok := normalizeKenyaPhone(in.Phone)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "phone must be a valid Kenya number (e.g. +2547XXXXXXXX)"})
+		return
+	}
+	in.Phone = phone
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
+
+	roleID, roleName, err := s.resolveRole(ctx, in.Role)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid role"})
+		return
+	}
 
 	if strings.TrimSpace(in.Password) != "" {
 		if len(in.Password) < 6 {
@@ -905,9 +1178,9 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		}
 		res, err := s.db.Exec(ctx, `
 			UPDATE users
-			SET name = $1, email = $2, role = $3, phone = $4, status = $5, password_hash = $6
-			WHERE id = $7
-		`, in.Name, in.Email, in.Role, in.Phone, in.Status, string(hash), userID)
+			SET name = $1, email = $2, role_id = $3, role = $4, phone = $5, status = $6, password_hash = $7
+			WHERE id = $8
+		`, in.Name, in.Email, roleID, roleName, in.Phone, in.Status, string(hash), userID)
 		if err != nil {
 			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update user"})
 			return
@@ -922,9 +1195,9 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.db.Exec(ctx, `
 		UPDATE users
-		SET name = $1, email = $2, role = $3, phone = $4, status = $5
-		WHERE id = $6
-	`, in.Name, in.Email, in.Role, in.Phone, in.Status, userID)
+		SET name = $1, email = $2, role_id = $3, role = $4, phone = $5, status = $6
+		WHERE id = $7
+	`, in.Name, in.Email, roleID, roleName, in.Phone, in.Status, userID)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update user"})
 		return
