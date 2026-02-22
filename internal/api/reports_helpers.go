@@ -29,10 +29,14 @@ func normalizeReportType(v string) string {
 		return "Financial"
 	case "health":
 		return "Health"
+	case "breeding":
+		return "Breeding"
 	case "resources":
 		return "Resources"
 	case "sales":
 		return "Sales"
+	case "feeding":
+		return "Feeding"
 	default:
 		return "Financial"
 	}
@@ -164,20 +168,31 @@ func (s *Server) buildReportContent(ctx context.Context, id int64, title string,
 		}
 
 	case "Resources":
-		var milk, wool, value float64
+		var milk, wool, meat, value float64
+		var milkCow, milkGoat float64
 		var eggs int64
 		_ = s.db.QueryRow(ctx, `
-			SELECT COALESCE(SUM(milk_liters), 0), COALESCE(SUM(eggs_count), 0), COALESCE(SUM(wool_kg), 0), COALESCE(SUM(total_value), 0)
+			SELECT
+				COALESCE(SUM(milk_liters), 0),
+				COALESCE(SUM(milk_cow_liters), 0),
+				COALESCE(SUM(milk_goat_liters), 0),
+				COALESCE(SUM(eggs_count), 0),
+				COALESCE(SUM(wool_kg), 0),
+				COALESCE(SUM(meat_kg), 0),
+				COALESCE(SUM(total_value), 0)
 			FROM production_logs
 			WHERE log_date BETWEEN $1 AND $2
-		`, start.Format("2006-01-02"), end.Format("2006-01-02")).Scan(&milk, &eggs, &wool, &value)
+		`, start.Format("2006-01-02"), end.Format("2006-01-02")).Scan(&milk, &milkCow, &milkGoat, &eggs, &wool, &meat, &value)
 		c.Summary["milkLiters"] = milk
+		c.Summary["milkCowLiters"] = milkCow
+		c.Summary["milkGoatLiters"] = milkGoat
 		c.Summary["eggsCount"] = eggs
 		c.Summary["woolKg"] = wool
+		c.Summary["meatKg"] = meat
 		c.Summary["totalValue"] = value
 
 		rows, err := s.db.Query(ctx, `
-			SELECT log_date, milk_liters, eggs_count, wool_kg, total_value
+			SELECT log_date, milk_liters, milk_cow_liters, milk_goat_liters, eggs_count, wool_kg, meat_kg, total_value
 			FROM production_logs
 			WHERE log_date BETWEEN $1 AND $2
 			ORDER BY log_date DESC
@@ -189,18 +204,183 @@ func (s *Server) buildReportContent(ctx context.Context, id int64, title string,
 		defer rows.Close()
 		for rows.Next() {
 			var d time.Time
-			var milkLiters, woolKg, totalValue float64
+			var milkLiters, milkCowLiters, milkGoatLiters, woolKg, meatKg, totalValue float64
 			var eggsCount int64
-			if err := rows.Scan(&d, &milkLiters, &eggsCount, &woolKg, &totalValue); err != nil {
+			if err := rows.Scan(&d, &milkLiters, &milkCowLiters, &milkGoatLiters, &eggsCount, &woolKg, &meatKg, &totalValue); err != nil {
 				return c, err
 			}
 			c.Records = append(c.Records, map[string]any{
 				"date":       s.formatISODate(d),
 				"milkLiters": milkLiters,
+				"milkCowLiters": milkCowLiters,
+				"milkGoatLiters": milkGoatLiters,
 				"eggsCount":  eggsCount,
 				"woolKg":     woolKg,
+				"meatKg":     meatKg,
 				"totalValue": totalValue,
 			})
+		}
+
+	case "Feeding":
+		var totalCost, avgDaily float64
+		var feedRecords int64
+		var topFeed string
+		var topFeedCost float64
+		_ = s.db.QueryRow(ctx, `
+			SELECT COALESCE(SUM(cost), 0), COUNT(*)
+			FROM feeding_records
+			WHERE feed_date BETWEEN $1 AND $2
+		`, start.Format("2006-01-02"), end.Format("2006-01-02")).Scan(&totalCost, &feedRecords)
+		_ = s.db.QueryRow(ctx, `
+			SELECT COALESCE(AVG(day_total), 0)
+			FROM (
+				SELECT feed_date, SUM(cost) AS day_total
+				FROM feeding_records
+				WHERE feed_date BETWEEN $1 AND $2
+				GROUP BY feed_date
+			) t
+		`, start.Format("2006-01-02"), end.Format("2006-01-02")).Scan(&avgDaily)
+		_ = s.db.QueryRow(ctx, `
+			SELECT feed_type, SUM(cost) AS total
+			FROM feeding_records
+			WHERE feed_date BETWEEN $1 AND $2
+			GROUP BY feed_type
+			ORDER BY total DESC
+			LIMIT 1
+		`, start.Format("2006-01-02"), end.Format("2006-01-02")).Scan(&topFeed, &topFeedCost)
+		c.Summary["totalFeedCost"] = totalCost
+		c.Summary["feedRecords"] = feedRecords
+		c.Summary["averageDailyCost"] = avgDaily
+		c.Summary["topFeed"] = topFeed
+		c.Summary["topFeedCost"] = topFeedCost
+
+		rows, err := s.db.Query(ctx, `
+			SELECT f.feed_date, COALESCE(a.tag_id, ''), f.feed_type, f.quantity_value, f.quantity_unit, f.cost, COALESCE(f.notes, '')
+			FROM feeding_records f
+			LEFT JOIN animals a ON a.id = f.animal_id
+			WHERE f.feed_date BETWEEN $1 AND $2
+			ORDER BY f.feed_date DESC, f.id DESC
+			LIMIT 250
+		`, start.Format("2006-01-02"), end.Format("2006-01-02"))
+		if err != nil {
+			return c, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var d time.Time
+			var tagID, feedType, unit, notes string
+			var qty, cost float64
+			if err := rows.Scan(&d, &tagID, &feedType, &qty, &unit, &cost, &notes); err != nil {
+				return c, err
+			}
+			c.Records = append(c.Records, map[string]any{
+				"date":          s.formatISODate(d),
+				"animalTagId":   tagID,
+				"feedType":      feedType,
+				"quantityValue": qty,
+				"quantityUnit":  unit,
+				"cost":          cost,
+				"notes":         notes,
+			})
+		}
+
+	case "Breeding":
+		var active, onHeat, aiAttempts, aiSuccess, expectedBirths int64
+		_ = s.db.QueryRow(ctx, `
+			SELECT COUNT(*) FILTER (WHERE status = 'active'),
+			       COUNT(*) FILTER (WHERE status = 'active' AND on_heat = true),
+			       COUNT(*) FILTER (WHERE ai_date BETWEEN $1 AND $2),
+			       COUNT(*) FILTER (
+			           WHERE ai_date BETWEEN $1 AND $2 AND (actual_birth_date IS NOT NULL OR COALESCE(offspring_count, 0) > 0 OR status = 'completed')
+			       ),
+			       COUNT(*) FILTER (WHERE expected_birth_date BETWEEN $1 AND $2)
+			FROM breeding_records
+		`, start.Format("2006-01-02"), end.Format("2006-01-02")).Scan(&active, &onHeat, &aiAttempts, &aiSuccess, &expectedBirths)
+
+		var eggsSet, chicksHatched int64
+		_ = s.db.QueryRow(ctx, `
+			SELECT COALESCE(SUM(eggs_set), 0), COALESCE(SUM(chicks_hatched), 0)
+			FROM poultry_breeding_records
+			WHERE egg_set_date BETWEEN $1 AND $2
+		`, start.Format("2006-01-02"), end.Format("2006-01-02")).Scan(&eggsSet, &chicksHatched)
+
+		c.Summary["activeBreeding"] = active
+		c.Summary["onHeat"] = onHeat
+		c.Summary["aiAttempts"] = aiAttempts
+		c.Summary["aiSuccess"] = aiSuccess
+		c.Summary["expectedBirths"] = expectedBirths
+		c.Summary["poultryEggsSet"] = eggsSet
+		c.Summary["poultryChicksHatched"] = chicksHatched
+
+		rows, err := s.db.Query(ctx, `
+			SELECT breed_date, mother_tag, father_tag, species, ai_date, heat_date, expected_birth_date, actual_birth_date, offspring_count, status
+			FROM (
+				SELECT b.breeding_date AS breed_date,
+				       COALESCE(m.tag_id, '') AS mother_tag,
+				       COALESCE(f.tag_id, '') AS father_tag,
+				       b.species,
+				       b.ai_date,
+				       b.heat_date,
+				       b.expected_birth_date,
+				       b.actual_birth_date,
+				       COALESCE(b.offspring_count, 0) AS offspring_count,
+				       b.status
+				FROM breeding_records b
+				LEFT JOIN animals m ON m.id = b.mother_animal_id
+				LEFT JOIN animals f ON f.id = b.father_animal_id
+				WHERE b.breeding_date BETWEEN $1 AND $2
+				UNION ALL
+				SELECT p.egg_set_date AS breed_date,
+				       COALESCE(h.tag_id, '') AS mother_tag,
+				       COALESCE(r.tag_id, '') AS father_tag,
+				       p.species,
+				       NULL::date AS ai_date,
+				       NULL::date AS heat_date,
+				       p.hatch_date AS expected_birth_date,
+				       p.hatch_date AS actual_birth_date,
+				       COALESCE(p.chicks_hatched, 0) AS offspring_count,
+				       p.status
+				FROM poultry_breeding_records p
+				LEFT JOIN animals h ON h.id = p.hen_animal_id
+				LEFT JOIN animals r ON r.id = p.rooster_animal_id
+				WHERE p.egg_set_date BETWEEN $1 AND $2
+			) t
+			ORDER BY breed_date DESC
+			LIMIT 250
+		`, start.Format("2006-01-02"), end.Format("2006-01-02"))
+		if err != nil {
+			return c, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var d time.Time
+			var aiDate, heatDate, expected, actual *time.Time
+			var mother, father, species, status string
+			var offspring int64
+			if err := rows.Scan(&d, &mother, &father, &species, &aiDate, &heatDate, &expected, &actual, &offspring, &status); err != nil {
+				return c, err
+			}
+			record := map[string]any{
+				"date":          s.formatISODate(d),
+				"motherTagId":   mother,
+				"fatherTagId":   father,
+				"species":       species,
+				"status":        status,
+				"offspringCount": offspring,
+			}
+			if aiDate != nil {
+				record["aiDate"] = s.formatISODate(*aiDate)
+			}
+			if heatDate != nil {
+				record["heatDate"] = s.formatISODate(*heatDate)
+			}
+			if expected != nil {
+				record["expectedBirthDate"] = s.formatISODate(*expected)
+			}
+			if actual != nil {
+				record["actualBirthDate"] = s.formatISODate(*actual)
+			}
+			c.Records = append(c.Records, record)
 		}
 
 	case "Sales":
@@ -548,8 +728,10 @@ func orderedReportSummaryKeys(category string, summaryKeys []string) []string {
 	priorityByCategory := map[string][]string{
 		"financial": {"grossRevenue", "netRevenue", "profit", "totalExpenses", "totalRevenue", "vatCollected"},
 		"sales":     {"grossRevenue", "netRevenue", "totalRevenue", "vatCollected", "transactions"},
-		"resources": {"totalValue", "milkLiters", "eggsCount", "woolKg"},
+		"resources": {"totalValue", "milkLiters", "milkCowLiters", "milkGoatLiters", "eggsCount", "woolKg", "meatKg"},
 		"health":    {"healthy", "attention", "sick"},
+		"feeding":   {"totalFeedCost", "averageDailyCost", "feedRecords", "topFeed", "topFeedCost"},
+		"breeding":  {"activeBreeding", "onHeat", "aiAttempts", "aiSuccess", "expectedBirths", "poultryEggsSet", "poultryChicksHatched"},
 	}
 	priority := priorityByCategory[strings.ToLower(strings.TrimSpace(category))]
 	if len(priority) == 0 {
@@ -586,12 +768,27 @@ func prettyMetricLabel(raw string) string {
 		"vatCollected":  "VAT Collected",
 		"transactions":  "Transactions",
 		"milkLiters":    "Milk (Liters)",
+		"milkCowLiters": "Milk (Cow)",
+		"milkGoatLiters": "Milk (Goat)",
 		"eggsCount":     "Eggs Count",
 		"woolKg":        "Wool (Kg)",
+		"meatKg":        "Meat (Kg)",
 		"totalValue":    "Total Value",
 		"healthy":       "Healthy Animals",
 		"attention":     "Needs Attention",
 		"sick":          "Sick Animals",
+		"totalFeedCost": "Total Feed Cost",
+		"averageDailyCost": "Average Daily Feed Cost",
+		"feedRecords":   "Feeding Records",
+		"topFeed":       "Top Feed",
+		"topFeedCost":   "Top Feed Cost",
+		"activeBreeding": "Active Breeding",
+		"onHeat":        "On Heat",
+		"aiAttempts":    "AI Attempts",
+		"aiSuccess":     "AI Success",
+		"expectedBirths": "Expected Births",
+		"poultryEggsSet": "Poultry Eggs Set",
+		"poultryChicksHatched": "Poultry Chicks Hatched",
 	}
 	if v, ok := known[raw]; ok {
 		return v
@@ -604,14 +801,14 @@ func prettyMetricLabel(raw string) string {
 
 func formatSummaryValue(key string, value any) string {
 	switch strings.ToLower(strings.TrimSpace(key)) {
-	case "grossrevenue", "netrevenue", "profit", "totalexpenses", "totalrevenue", "vatcollected", "totalvalue":
+	case "grossrevenue", "netrevenue", "profit", "totalexpenses", "totalrevenue", "vatcollected", "totalvalue", "totalfeedcost", "topfeedcost", "averagedailycost":
 		return formatAnyCurrency(value)
-	case "transactions", "healthy", "attention", "sick", "eggscount":
+	case "transactions", "healthy", "attention", "sick", "eggscount", "feedrecords", "activebreeding", "onheat", "aiattempts", "aisuccess", "expectedbirths", "poultryeggsset", "poultrychickshatched":
 		if n, ok := asFloat64(value); ok {
 			return fmt.Sprintf("%d", int64(math.Round(n)))
 		}
 		return fmt.Sprint(value)
-	case "milkliters", "woolkg":
+	case "milkliters", "milkcowliters", "milkgoatliters", "woolkg", "meatkg":
 		return formatAnyNumber(value)
 	default:
 		if n, ok := asFloat64(value); ok {
@@ -630,7 +827,9 @@ func buildRecordHighlights(report reportContent) ([]string, [][]string, string) 
 	headersByCategory := map[string][]string{
 		"financial": {"#", "Date", "Type", "Item", "Amount"},
 		"sales":     {"#", "Date", "Product", "Qty", "Buyer", "Total"},
-		"resources": {"#", "Date", "Milk (L)", "Eggs", "Wool (Kg)", "Value"},
+		"resources": {"#", "Date", "Milk (L)", "Eggs", "Wool (Kg)", "Meat (Kg)", "Value"},
+		"feeding":   {"#", "Date", "Tag", "Feed", "Qty", "Cost"},
+		"breeding":  {"#", "Date", "Species", "Mother", "Father", "Status"},
 		"health":    {"#", "Date", "Tag", "Action", "Treatment", "Vet"},
 	}
 	category := strings.ToLower(strings.TrimSpace(report.Category))
@@ -670,7 +869,26 @@ func buildRecordHighlights(report reportContent) ([]string, [][]string, string) 
 				formatAnyNumber(r["milkLiters"]),
 				formatAnyNumber(r["eggsCount"]),
 				formatAnyNumber(r["woolKg"]),
+				formatAnyNumber(r["meatKg"]),
 				formatAnyCurrency(r["totalValue"]),
+			})
+		case "feeding":
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", i+1),
+				fmt.Sprint(r["date"]),
+				fmt.Sprint(r["animalTagId"]),
+				fmt.Sprint(r["feedType"]),
+				strings.TrimSpace(fmt.Sprintf("%s %s", formatAnyNumber(r["quantityValue"]), fmt.Sprint(r["quantityUnit"]))),
+				formatAnyCurrency(r["cost"]),
+			})
+		case "breeding":
+			rows = append(rows, []string{
+				fmt.Sprintf("%d", i+1),
+				fmt.Sprint(r["date"]),
+				fmt.Sprint(r["species"]),
+				fmt.Sprint(r["motherTagId"]),
+				fmt.Sprint(r["fatherTagId"]),
+				fmt.Sprint(r["status"]),
 			})
 		case "health":
 			rows = append(rows, []string{
@@ -703,7 +921,11 @@ func highlightColumnWidths(category string, headerCount int) []int {
 	case "sales":
 		return []int{24, 70, 118, 72, 134, 78}
 	case "resources":
-		return []int{24, 70, 88, 64, 88, 86}
+		return []int{24, 62, 76, 58, 72, 72, 86}
+	case "feeding":
+		return []int{24, 70, 70, 112, 78, 78}
+	case "breeding":
+		return []int{24, 70, 86, 88, 88, 90}
 	case "health":
 		return []int{24, 66, 64, 88, 142, 112}
 	default:
@@ -743,8 +965,23 @@ func formatRecordHighlight(category string, record map[string]any) string {
 		milk := formatAnyNumber(record["milkLiters"])
 		eggs := formatAnyNumber(record["eggsCount"])
 		wool := formatAnyNumber(record["woolKg"])
+		meat := formatAnyNumber(record["meatKg"])
 		total := formatAnyCurrency(record["totalValue"])
-		return fmt.Sprintf("%s | Milk %s L | Eggs %s | Wool %s Kg | %s", date, milk, eggs, wool, total)
+		return fmt.Sprintf("%s | Milk %s L | Eggs %s | Wool %s Kg | Meat %s Kg | %s", date, milk, eggs, wool, meat, total)
+	case "feeding":
+		date := fmt.Sprint(record["date"])
+		tag := fmt.Sprint(record["animalTagId"])
+		feed := fmt.Sprint(record["feedType"])
+		qty := strings.TrimSpace(fmt.Sprintf("%s %s", formatAnyNumber(record["quantityValue"]), fmt.Sprint(record["quantityUnit"])))
+		cost := formatAnyCurrency(record["cost"])
+		return fmt.Sprintf("%s | Tag %s | %s | %s | %s", date, tag, feed, qty, cost)
+	case "breeding":
+		date := fmt.Sprint(record["date"])
+		species := fmt.Sprint(record["species"])
+		mother := fmt.Sprint(record["motherTagId"])
+		father := fmt.Sprint(record["fatherTagId"])
+		status := fmt.Sprint(record["status"])
+		return fmt.Sprintf("%s | %s | M:%s | F:%s | %s", date, species, mother, father, status)
 	case "health":
 		date := fmt.Sprint(record["date"])
 		tag := fmt.Sprint(record["animalTagId"])

@@ -41,6 +41,8 @@ INSERT INTO permissions(key, description) VALUES
   ('animals.write', 'Create, update, delete animals'),
   ('health.read', 'Read health records and schedules'),
   ('health.write', 'Create, update, delete health records'),
+  ('feeding.read', 'Read feeding records'),
+  ('feeding.write', 'Create, update, delete feeding records'),
   ('breeding.read', 'Read breeding records'),
   ('breeding.write', 'Create, update, delete breeding records'),
   ('production.read', 'Read production data'),
@@ -65,7 +67,7 @@ INSERT INTO role_permissions(role_id, permission_id)
 SELECT r.id, p.id
 FROM roles r
 JOIN permissions p ON p.key IN (
-  'dashboard.read','animals.read','animals.write','health.read','health.write',
+  'dashboard.read','animals.read','animals.write','health.read','health.write','feeding.read','feeding.write',
   'breeding.read','breeding.write','production.read','production.create','production.manage',
   'expenses.read','expenses.write','sales.read','sales.write','reports.read','reports.generate','etims.manage',
   'users.read','users.manage'
@@ -77,7 +79,7 @@ INSERT INTO role_permissions(role_id, permission_id)
 SELECT r.id, p.id
 FROM roles r
 JOIN permissions p ON p.key IN (
-  'dashboard.read','animals.read','animals.write','health.read','health.write',
+  'dashboard.read','animals.read','animals.write','health.read','health.write','feeding.read','feeding.write',
   'breeding.read','breeding.write','production.read','production.create','production.manage',
   'expenses.read','expenses.write','sales.read','sales.write','reports.read','reports.generate','etims.manage',
   'users.read'
@@ -89,7 +91,7 @@ INSERT INTO role_permissions(role_id, permission_id)
 SELECT r.id, p.id
 FROM roles r
 JOIN permissions p ON p.key IN (
-  'dashboard.read','animals.read','health.read','health.write','reports.read'
+  'dashboard.read','animals.read','health.read','health.write','feeding.read','reports.read'
 )
 WHERE r.name = 'veterinarian'
 ON CONFLICT DO NOTHING;
@@ -98,7 +100,7 @@ INSERT INTO role_permissions(role_id, permission_id)
 SELECT r.id, p.id
 FROM roles r
 JOIN permissions p ON p.key IN (
-  'dashboard.read','animals.read','production.read','production.create'
+  'dashboard.read','animals.read','production.read','production.create','feeding.read'
 )
 WHERE r.name = 'worker'
 ON CONFLICT DO NOTHING;
@@ -157,9 +159,15 @@ CREATE TABLE IF NOT EXISTS health_records (
 CREATE TABLE IF NOT EXISTS breeding_records (
   id SERIAL PRIMARY KEY,
   mother_animal_id INTEGER NOT NULL REFERENCES animals(id) ON DELETE CASCADE,
-  father_animal_id INTEGER NOT NULL REFERENCES animals(id) ON DELETE CASCADE,
+  father_animal_id INTEGER REFERENCES animals(id) ON DELETE CASCADE,
   species TEXT NOT NULL,
   breeding_date DATE NOT NULL,
+  heat_date DATE,
+  ai_date DATE,
+  on_heat BOOLEAN NOT NULL DEFAULT FALSE,
+  ai_sire_source TEXT,
+  ai_sire_name TEXT,
+  ai_sire_code TEXT,
   expected_birth_date DATE,
   actual_birth_date DATE,
   offspring_count INTEGER,
@@ -168,12 +176,16 @@ CREATE TABLE IF NOT EXISTS breeding_records (
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
+
 CREATE TABLE IF NOT EXISTS production_logs (
   id SERIAL PRIMARY KEY,
   log_date DATE NOT NULL UNIQUE,
   milk_liters NUMERIC(10,2) NOT NULL DEFAULT 0,
+  milk_cow_liters NUMERIC(10,2) NOT NULL DEFAULT 0,
+  milk_goat_liters NUMERIC(10,2) NOT NULL DEFAULT 0,
   eggs_count INTEGER NOT NULL DEFAULT 0,
   wool_kg NUMERIC(10,2) NOT NULL DEFAULT 0,
+  meat_kg NUMERIC(10,2) NOT NULL DEFAULT 0,
   total_value NUMERIC(12,2) NOT NULL DEFAULT 0,
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -185,6 +197,52 @@ CREATE TABLE IF NOT EXISTS expenses (
   item TEXT NOT NULL,
   vendor TEXT NOT NULL,
   amount NUMERIC(12,2) NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS feeding_rations (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  species TEXT NOT NULL DEFAULT '',
+  state TEXT NOT NULL DEFAULT '',
+  notes TEXT,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS feeding_ration_items (
+  id SERIAL PRIMARY KEY,
+  ration_id INTEGER NOT NULL REFERENCES feeding_rations(id) ON DELETE CASCADE,
+  ingredient TEXT NOT NULL,
+  quantity_value NUMERIC(12,2) NOT NULL DEFAULT 0,
+  quantity_unit TEXT NOT NULL DEFAULT 'kg'
+);
+
+CREATE TABLE IF NOT EXISTS feeding_plans (
+  id SERIAL PRIMARY KEY,
+  animal_id INTEGER REFERENCES animals(id) ON DELETE SET NULL,
+  ration_id INTEGER REFERENCES feeding_rations(id) ON DELETE SET NULL,
+  animal_state TEXT NOT NULL DEFAULT '',
+  daily_quantity_value NUMERIC(12,2) NOT NULL DEFAULT 0,
+  daily_quantity_unit TEXT NOT NULL DEFAULT 'kg',
+  start_date DATE NOT NULL,
+  end_date DATE,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused', 'completed')),
+  notes TEXT,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS feeding_records (
+  id SERIAL PRIMARY KEY,
+  feed_date DATE NOT NULL,
+  animal_id INTEGER REFERENCES animals(id) ON DELETE SET NULL,
+  ration_id INTEGER REFERENCES feeding_rations(id) ON DELETE SET NULL,
+  plan_id INTEGER REFERENCES feeding_plans(id) ON DELETE SET NULL,
+  feed_type TEXT NOT NULL,
+  quantity_value NUMERIC(12,2) NOT NULL DEFAULT 0,
+  quantity_unit TEXT NOT NULL DEFAULT 'kg',
+  supplier TEXT NOT NULL DEFAULT '',
+  cost NUMERIC(12,2) NOT NULL DEFAULT 0,
+  notes TEXT,
   created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
@@ -215,6 +273,37 @@ ALTER TABLE sales ADD COLUMN IF NOT EXISTS vat_rate NUMERIC(5,4) NOT NULL DEFAUL
 ALTER TABLE sales ADD COLUMN IF NOT EXISTS vat_amount NUMERIC(12,2) NOT NULL DEFAULT 0;
 ALTER TABLE sales ADD COLUMN IF NOT EXISTS net_amount NUMERIC(12,2) NOT NULL DEFAULT 0;
 
+ALTER TABLE breeding_records ADD COLUMN IF NOT EXISTS heat_date DATE;
+ALTER TABLE breeding_records ADD COLUMN IF NOT EXISTS ai_date DATE;
+ALTER TABLE breeding_records ADD COLUMN IF NOT EXISTS on_heat BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE breeding_records ADD COLUMN IF NOT EXISTS ai_sire_source TEXT;
+ALTER TABLE breeding_records ADD COLUMN IF NOT EXISTS ai_sire_name TEXT;
+ALTER TABLE breeding_records ADD COLUMN IF NOT EXISTS ai_sire_code TEXT;
+ALTER TABLE breeding_records ALTER COLUMN father_animal_id DROP NOT NULL;
+ALTER TABLE breeding_records DROP CONSTRAINT IF EXISTS breeding_records_ai_sire_source_check;
+ALTER TABLE breeding_records ADD CONSTRAINT breeding_records_ai_sire_source_check CHECK (ai_sire_source IS NULL OR ai_sire_source IN ('internal', 'external', 'semen_batch'));
+
+ALTER TABLE production_logs ADD COLUMN IF NOT EXISTS milk_cow_liters NUMERIC(10,2) NOT NULL DEFAULT 0;
+ALTER TABLE production_logs ADD COLUMN IF NOT EXISTS milk_goat_liters NUMERIC(10,2) NOT NULL DEFAULT 0;
+ALTER TABLE production_logs ADD COLUMN IF NOT EXISTS meat_kg NUMERIC(10,2) NOT NULL DEFAULT 0;
+
+ALTER TABLE feeding_records ADD COLUMN IF NOT EXISTS ration_id INTEGER REFERENCES feeding_rations(id) ON DELETE SET NULL;
+ALTER TABLE feeding_records ADD COLUMN IF NOT EXISTS plan_id INTEGER REFERENCES feeding_plans(id) ON DELETE SET NULL;
+
+CREATE TABLE IF NOT EXISTS poultry_breeding_records (
+  id SERIAL PRIMARY KEY,
+  hen_animal_id INTEGER NOT NULL REFERENCES animals(id) ON DELETE CASCADE,
+  rooster_animal_id INTEGER REFERENCES animals(id) ON DELETE SET NULL,
+  species TEXT NOT NULL,
+  egg_set_date DATE NOT NULL,
+  hatch_date DATE,
+  eggs_set INTEGER NOT NULL DEFAULT 0,
+  chicks_hatched INTEGER,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'cancelled')),
+  notes TEXT,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS reports (
   id SERIAL PRIMARY KEY,
   title TEXT NOT NULL,
@@ -243,6 +332,11 @@ CREATE INDEX IF NOT EXISTS idx_animals_status ON animals(status, health_status);
 CREATE INDEX IF NOT EXISTS idx_health_next_due ON health_records(next_due);
 CREATE INDEX IF NOT EXISTS idx_production_log_date ON production_logs(log_date);
 CREATE INDEX IF NOT EXISTS idx_expense_date ON expenses(expense_date);
+CREATE INDEX IF NOT EXISTS idx_feeding_date ON feeding_records(feed_date);
+CREATE INDEX IF NOT EXISTS idx_feeding_animal ON feeding_records(animal_id);
+CREATE INDEX IF NOT EXISTS idx_feeding_ration ON feeding_records(ration_id);
+CREATE INDEX IF NOT EXISTS idx_feeding_plan ON feeding_records(plan_id);
+CREATE INDEX IF NOT EXISTS idx_feeding_plan_animal ON feeding_plans(animal_id);
 CREATE INDEX IF NOT EXISTS idx_sale_date ON sales(sale_date);
 CREATE INDEX IF NOT EXISTS idx_users_role_id ON users(role_id);
 CREATE INDEX IF NOT EXISTS idx_role_permissions_role_id ON role_permissions(role_id);

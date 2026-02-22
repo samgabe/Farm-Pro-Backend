@@ -15,6 +15,7 @@ type Config struct {
 	FrontendBaseURL    string
 	AppTimezone        string
 	KRAPIN             string
+	MLBaseURL          string
 	SMTPHost           string
 	SMTPPort           string
 	SMTPUsername       string
@@ -33,6 +34,7 @@ func Load() (Config, error) {
 		FrontendBaseURL:    getEnvOrDefault("FRONTEND_BASE_URL", "http://localhost:5173"),
 		AppTimezone:        getEnvOrDefault("APP_TIMEZONE", "Africa/Nairobi"),
 		KRAPIN:             strings.TrimSpace(os.Getenv("KRA_PIN")),
+		MLBaseURL:          strings.TrimSpace(os.Getenv("ML_BASE_URL")),
 		SMTPHost:           strings.TrimSpace(os.Getenv("SMTP_HOST")),
 		SMTPPort:           getEnvOrDefault("SMTP_PORT", "587"),
 		SMTPUsername:       strings.TrimSpace(os.Getenv("SMTP_USERNAME")),

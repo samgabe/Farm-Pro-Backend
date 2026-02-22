@@ -19,6 +19,7 @@ type Server struct {
 	frontendBaseURL string
 	kraPIN          string
 	location        *time.Location
+	mlBaseURL       string
 }
 
 type authContextKey string
@@ -27,7 +28,7 @@ const userIDContextKey authContextKey = "user_id"
 const userRoleContextKey authContextKey = "user_role"
 const userPermissionsContextKey authContextKey = "user_permissions"
 
-func NewServer(db *pgxpool.Pool, jwtSecret string, corsAllowedOrigins []string, mailer *smtpMailer, frontendBaseURL string, appTimezone string, kraPIN string) *Server {
+func NewServer(db *pgxpool.Pool, jwtSecret string, corsAllowedOrigins []string, mailer *smtpMailer, frontendBaseURL string, appTimezone string, kraPIN string, mlBaseURL string) *Server {
 	allowedOrigins := make(map[string]struct{}, len(corsAllowedOrigins))
 	allowAnyOrigin := false
 	for _, raw := range corsAllowedOrigins {
@@ -57,6 +58,7 @@ func NewServer(db *pgxpool.Pool, jwtSecret string, corsAllowedOrigins []string, 
 		frontendBaseURL: strings.TrimRight(strings.TrimSpace(frontendBaseURL), "/"),
 		kraPIN:          strings.ToUpper(strings.TrimSpace(kraPIN)),
 		location:        loc,
+		mlBaseURL:       strings.TrimRight(strings.TrimSpace(mlBaseURL), "/"),
 	}
 }
 
@@ -86,10 +88,14 @@ func (s *Server) Mux() http.Handler {
 	mux.Handle("DELETE /api/health/records/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDeleteHealthRecord), "health.write")))
 	mux.Handle("GET /api/breeding/active", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleBreedingActive), "breeding.read")))
 	mux.Handle("GET /api/breeding/births", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleBreedingBirths), "breeding.read")))
+	mux.Handle("GET /api/breeding/poultry/active", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleBreedingPoultryActive), "breeding.read")))
 	mux.Handle("POST /api/breeding", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreateBreedingRecord), "breeding.write")))
 	mux.Handle("PUT /api/breeding/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUpdateBreedingRecord), "breeding.write")))
 	mux.Handle("POST /api/breeding/{id}/birth", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleRecordBirth), "breeding.write")))
 	mux.Handle("DELETE /api/breeding/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDeleteBreedingRecord), "breeding.write")))
+	mux.Handle("POST /api/breeding/poultry", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreatePoultryBreedingRecord), "breeding.write")))
+	mux.Handle("PUT /api/breeding/poultry/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUpdatePoultryBreedingRecord), "breeding.write")))
+	mux.Handle("DELETE /api/breeding/poultry/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDeletePoultryBreedingRecord), "breeding.write")))
 	mux.Handle("GET /api/production/summary", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleProductionSummary), "production.read")))
 	mux.Handle("GET /api/production/logs", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleProductionLogs), "production.read")))
 	mux.Handle("POST /api/production/logs", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreateProductionLog), "production.create")))
@@ -100,6 +106,22 @@ func (s *Server) Mux() http.Handler {
 	mux.Handle("POST /api/expenses", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreateExpense), "expenses.write")))
 	mux.Handle("PUT /api/expenses/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUpdateExpense), "expenses.write")))
 	mux.Handle("DELETE /api/expenses/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDeleteExpense), "expenses.write")))
+	mux.Handle("GET /api/feeding/summary", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleFeedingSummary), "feeding.read")))
+	mux.Handle("GET /api/feeding", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleFeeding), "feeding.read")))
+	mux.Handle("POST /api/feeding", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreateFeedingRecord), "feeding.write")))
+	mux.Handle("PUT /api/feeding/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUpdateFeedingRecord), "feeding.write")))
+	mux.Handle("DELETE /api/feeding/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDeleteFeedingRecord), "feeding.write")))
+	mux.Handle("GET /api/feeding/rations", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleFeedingRations), "feeding.read")))
+	mux.Handle("POST /api/feeding/rations", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreateFeedingRation), "feeding.write")))
+	mux.Handle("PUT /api/feeding/rations/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUpdateFeedingRation), "feeding.write")))
+	mux.Handle("DELETE /api/feeding/rations/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDeleteFeedingRation), "feeding.write")))
+	mux.Handle("GET /api/feeding/plans", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleFeedingPlans), "feeding.read")))
+	mux.Handle("POST /api/feeding/plans", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreateFeedingPlan), "feeding.write")))
+	mux.Handle("PUT /api/feeding/plans/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleUpdateFeedingPlan), "feeding.write")))
+	mux.Handle("DELETE /api/feeding/plans/{id}", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleDeleteFeedingPlan), "feeding.write")))
+	mux.Handle("GET /api/insights", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleInsights), "dashboard.read")))
+	mux.Handle("GET /api/ml/insights", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleMLInsights), "dashboard.read")))
+	mux.Handle("POST /api/ml/train", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleMLTrain), "dashboard.read")))
 	mux.Handle("GET /api/sales/summary", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleSalesSummary), "sales.read")))
 	mux.Handle("GET /api/sales", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleSales), "sales.read")))
 	mux.Handle("POST /api/sales", s.authRequired(s.permissionRequired(http.HandlerFunc(s.handleCreateSale), "sales.write")))

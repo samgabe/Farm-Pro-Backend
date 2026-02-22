@@ -104,6 +104,284 @@ func (s *Server) handleExpenses(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleFeedingSummary(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	var total, dailyAvg float64
+	var topFeed string
+	var topCost float64
+
+	_ = s.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(cost), 0)
+		FROM feeding_records
+		WHERE DATE_TRUNC('month', feed_date) = DATE_TRUNC('month', CURRENT_DATE)
+	`).Scan(&total)
+	_ = s.db.QueryRow(ctx, `
+		SELECT COALESCE(AVG(day_total), 0)
+		FROM (
+			SELECT feed_date, SUM(cost) AS day_total
+			FROM feeding_records
+			WHERE DATE_TRUNC('month', feed_date) = DATE_TRUNC('month', CURRENT_DATE)
+			GROUP BY feed_date
+		) t
+	`).Scan(&dailyAvg)
+	_ = s.db.QueryRow(ctx, `
+		SELECT feed_type, SUM(cost) AS total
+		FROM feeding_records
+		GROUP BY feed_type
+		ORDER BY total DESC
+		LIMIT 1
+	`).Scan(&topFeed, &topCost)
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"totalCost":  total,
+		"dailyAverage": dailyAvg,
+		"topFeed":    topFeed,
+		"topCost":    topCost,
+	})
+}
+
+func (s *Server) handleFeeding(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	page, pageSize := parsePagination(r)
+	search := parseSearch(r)
+	offset := (page - 1) * pageSize
+
+	var total int64
+	_ = s.db.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM feeding_records f
+		LEFT JOIN animals a ON a.id = f.animal_id
+		WHERE ($1 = '' OR f.feed_type ILIKE '%' || $1 || '%' OR f.supplier ILIKE '%' || $1 || '%' OR COALESCE(a.tag_id,'') ILIKE '%' || $1 || '%')
+	`, search).Scan(&total)
+
+	rows, err := s.db.Query(ctx, `
+		SELECT f.id, f.feed_date, COALESCE(a.tag_id, ''), f.feed_type, f.quantity_value, f.quantity_unit, f.supplier, f.cost, COALESCE(f.notes,''),
+		       f.ration_id, COALESCE(r.name, ''), f.plan_id
+		FROM feeding_records f
+		LEFT JOIN animals a ON a.id = f.animal_id
+		LEFT JOIN feeding_rations r ON r.id = f.ration_id
+		WHERE ($1 = '' OR f.feed_type ILIKE '%' || $1 || '%' OR f.supplier ILIKE '%' || $1 || '%' OR COALESCE(a.tag_id,'') ILIKE '%' || $1 || '%')
+		ORDER BY f.feed_date DESC, f.id DESC
+		LIMIT $2 OFFSET $3
+	`, search, pageSize, offset)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load feeding records"})
+		return
+	}
+	defer rows.Close()
+
+	out := make([]map[string]any, 0)
+	for rows.Next() {
+		var id int64
+		var d time.Time
+		var animalTag, feedType, unit, supplier, notes, rationName string
+		var qty, cost float64
+		var rationID, planID *int64
+		if err := rows.Scan(&id, &d, &animalTag, &feedType, &qty, &unit, &supplier, &cost, &notes, &rationID, &rationName, &planID); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse feeding records"})
+			return
+		}
+		rationIDOut := int64(0)
+		if rationID != nil {
+			rationIDOut = *rationID
+		}
+		planIDOut := int64(0)
+		if planID != nil {
+			planIDOut = *planID
+		}
+		out = append(out, map[string]any{
+			"id":         id,
+			"date":       s.formatDateCompact(d),
+			"dateRaw":    s.formatISODate(d),
+			"animalTag":  animalTag,
+			"feedType":   feedType,
+			"quantity":   fmt.Sprintf("%s %s", trimZero(qty), unit),
+			"quantityValue": qty,
+			"quantityUnit":  unit,
+			"supplier":   supplier,
+			"cost":       formatKES(cost),
+			"costRaw":    cost,
+			"notes":      notes,
+			"rationId":   rationIDOut,
+			"rationName": rationName,
+			"planId":     planIDOut,
+		})
+	}
+	respondJSON(w, http.StatusOK, map[string]any{
+		"items":    out,
+		"total":    total,
+		"page":     page,
+		"pageSize": pageSize,
+	})
+}
+
+func (s *Server) handleFeedingRations(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	page, pageSize := parsePagination(r)
+	search := parseSearch(r)
+	offset := (page - 1) * pageSize
+
+	var total int64
+	_ = s.db.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM feeding_rations
+		WHERE ($1 = '' OR name ILIKE '%' || $1 || '%' OR species ILIKE '%' || $1 || '%' OR state ILIKE '%' || $1 || '%')
+	`, search).Scan(&total)
+
+	rows, err := s.db.Query(ctx, `
+		SELECT id, name, species, state, COALESCE(notes,'')
+		FROM feeding_rations
+		WHERE ($1 = '' OR name ILIKE '%' || $1 || '%' OR species ILIKE '%' || $1 || '%' OR state ILIKE '%' || $1 || '%')
+		ORDER BY name
+		LIMIT $2 OFFSET $3
+	`, search, pageSize, offset)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load rations"})
+		return
+	}
+	defer rows.Close()
+
+	rations := make([]map[string]any, 0)
+	rationIDs := make([]int64, 0)
+	for rows.Next() {
+		var id int64
+		var name, species, state, notes string
+		if err := rows.Scan(&id, &name, &species, &state, &notes); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse rations"})
+			return
+		}
+			rations = append(rations, map[string]any{
+				"id":      id,
+				"name":    name,
+				"species": species,
+				"state":   state,
+				"notes":   notes,
+				"items":   []map[string]any{},
+			})
+			rationIDs = append(rationIDs, id)
+		}
+
+	if len(rationIDs) > 0 {
+		rows, err = s.db.Query(ctx, `
+			SELECT ration_id, ingredient, quantity_value, quantity_unit
+			FROM feeding_ration_items
+			WHERE ration_id = ANY($1)
+			ORDER BY id
+		`, rationIDs)
+		if err == nil {
+			itemsByRation := map[int64][]map[string]any{}
+			for rows.Next() {
+				var rid int64
+				var ingredient, unit string
+				var qty float64
+				if err := rows.Scan(&rid, &ingredient, &qty, &unit); err != nil {
+					continue
+				}
+				itemsByRation[rid] = append(itemsByRation[rid], map[string]any{
+					"ingredient": ingredient,
+					"quantity":   qty,
+					"unit":       unit,
+				})
+			}
+			rows.Close()
+			for i := range rations {
+				rid, _ := rations[i]["id"].(int64)
+				rations[i]["items"] = itemsByRation[rid]
+			}
+		}
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"items":    rations,
+		"total":    total,
+		"page":     page,
+		"pageSize": pageSize,
+	})
+}
+
+func (s *Server) handleFeedingPlans(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	page, pageSize := parsePagination(r)
+	search := parseSearch(r)
+	offset := (page - 1) * pageSize
+
+	var total int64
+	_ = s.db.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM feeding_plans p
+		LEFT JOIN animals a ON a.id = p.animal_id
+		LEFT JOIN feeding_rations r ON r.id = p.ration_id
+		WHERE ($1 = '' OR COALESCE(a.tag_id,'') ILIKE '%' || $1 || '%' OR COALESCE(r.name,'') ILIKE '%' || $1 || '%' OR p.animal_state ILIKE '%' || $1 || '%')
+	`, search).Scan(&total)
+
+	rows, err := s.db.Query(ctx, `
+		SELECT p.id, COALESCE(a.tag_id,''), COALESCE(r.name,''), p.ration_id, p.animal_state, p.daily_quantity_value, p.daily_quantity_unit,
+		       p.start_date, p.end_date, p.status, COALESCE(p.notes,'')
+		FROM feeding_plans p
+		LEFT JOIN animals a ON a.id = p.animal_id
+		LEFT JOIN feeding_rations r ON r.id = p.ration_id
+		WHERE ($1 = '' OR COALESCE(a.tag_id,'') ILIKE '%' || $1 || '%' OR COALESCE(r.name,'') ILIKE '%' || $1 || '%' OR p.animal_state ILIKE '%' || $1 || '%')
+		ORDER BY p.start_date DESC, p.id DESC
+		LIMIT $2 OFFSET $3
+	`, search, pageSize, offset)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load feeding plans"})
+		return
+	}
+	defer rows.Close()
+
+	out := make([]map[string]any, 0)
+	for rows.Next() {
+		var id int64
+		var animalTag, rationName, unit, state, status, notes string
+		var qty float64
+		var start time.Time
+		var end *time.Time
+		var rationID *int64
+		if err := rows.Scan(&id, &animalTag, &rationName, &rationID, &state, &qty, &unit, &start, &end, &status, &notes); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse feeding plans"})
+			return
+		}
+		rid := int64(0)
+		if rationID != nil {
+			rid = *rationID
+		}
+		endOut := ""
+		if end != nil {
+			endOut = s.formatISODate(*end)
+		}
+		out = append(out, map[string]any{
+			"id":              id,
+			"animalTag":       animalTag,
+			"rationId":        rid,
+			"rationName":      rationName,
+			"state":           state,
+			"dailyQuantity":   fmt.Sprintf("%s %s", trimZero(qty), unit),
+			"dailyQuantityValue": qty,
+			"dailyQuantityUnit":  unit,
+			"startDate":       s.formatISODate(start),
+			"endDate":         endOut,
+			"status":          status,
+			"notes":           notes,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"items":    out,
+		"total":    total,
+		"page":     page,
+		"pageSize": pageSize,
+	})
+}
+
 func (s *Server) handleSalesSummary(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()

@@ -57,6 +57,19 @@ func (s *Server) formatISODate(d time.Time) string {
 	return d.In(s.location).Format("2006-01-02")
 }
 
+func speciesProfile(species string) string {
+	v := strings.ToLower(strings.TrimSpace(species))
+	if v == "" {
+		return "mammal"
+	}
+	switch v {
+	case "poultry", "chicken", "hen", "rooster", "broiler", "layer", "duck", "turkey", "quail", "goose", "guinea fowl", "guineafowl":
+		return "poultry"
+	default:
+		return "mammal"
+	}
+}
+
 func formatKES(v float64) string {
 	return "KSh " + trimZero(v)
 }
@@ -109,6 +122,47 @@ func normalizeAnimalTag(raw string) (string, bool) {
 		return "", false
 	}
 	return v, true
+}
+
+func expectedTagPrefixByType(animalType string) (string, bool) {
+	v := strings.ToLower(strings.TrimSpace(animalType))
+	if v == "" {
+		return "", false
+	}
+	switch v {
+	case "cattle", "cow", "bull", "heifer":
+		return "C-", true
+	case "goat", "goats":
+		return "G-", true
+	case "sheep", "ram", "ewe":
+		return "S-", true
+	case "pig", "swine", "boar", "sow":
+		return "P-", true
+	case "horse", "mare", "stallion":
+		return "H-", true
+	case "donkey", "ass", "mule":
+		return "DN-", true
+	case "camel":
+		return "CM-", true
+	case "buffalo":
+		return "BF-", true
+	case "rabbit":
+		return "RB-", true
+	case "chicken", "hen", "rooster", "broiler", "layer":
+		return "CH-", true
+	case "duck":
+		return "DK-", true
+	case "goose":
+		return "GS-", true
+	case "turkey":
+		return "TK-", true
+	case "quail":
+		return "Q-", true
+	case "guinea fowl", "guineafowl":
+		return "GF-", true
+	default:
+		return "", false
+	}
 }
 
 func (s *Server) frontendURL(pathWithLeadingSlash string) string {

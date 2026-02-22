@@ -42,7 +42,16 @@ func main() {
 	}
 
 	mailer := api.NewSMTPMailer(cfg.SMTPHost, cfg.SMTPPort, cfg.SMTPUsername, cfg.SMTPPassword, cfg.FromName, cfg.FromEmail)
-	srv := api.NewServer(pool, cfg.JWTSecret, cfg.CORSAllowedOrigins, mailer, cfg.FrontendBaseURL, cfg.AppTimezone, cfg.KRAPIN)
+	srv := api.NewServer(
+		pool,
+		cfg.JWTSecret,
+		cfg.CORSAllowedOrigins,
+		mailer,
+		cfg.FrontendBaseURL,
+		cfg.AppTimezone,
+		cfg.KRAPIN,
+		cfg.MLBaseURL,
+	)
 	httpServer := &http.Server{
 		Addr:         ":" + cfg.Port,
 		Handler:      srv.Mux(),

@@ -46,6 +46,12 @@ func (s *Server) handleCreateAnimal(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "tagId, type, and breed are required"})
 		return
 	}
+	if prefix, ok := expectedTagPrefixByType(in.Type); ok {
+		if !strings.HasPrefix(in.TagID, prefix) {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("tagId must start with %s for %s", prefix, in.Type)})
+			return
+		}
+	}
 
 	birthDate, err := optionalDate(in.BirthDate)
 	if err != nil {
@@ -107,6 +113,12 @@ func (s *Server) handleUpdateAnimal(w http.ResponseWriter, r *http.Request) {
 	if in.Type == "" || in.Breed == "" {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "type and breed are required"})
 		return
+	}
+	if prefix, ok := expectedTagPrefixByType(in.Type); ok {
+		if !strings.HasPrefix(tagID, prefix) {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("tagId must start with %s for %s", prefix, in.Type)})
+			return
+		}
 	}
 	birthDate, err := optionalDate(in.BirthDate)
 	if err != nil {
@@ -322,6 +334,12 @@ func (s *Server) handleCreateBreedingRecord(w http.ResponseWriter, r *http.Reque
 		FatherTagID       string `json:"fatherTagId"`
 		Species           string `json:"species"`
 		BreedingDate      string `json:"breedingDate"`
+		HeatDate          string `json:"heatDate"`
+		AIDate            string `json:"aiDate"`
+		OnHeat            *bool  `json:"onHeat"`
+		AISireSource      string `json:"aiSireSource"`
+		AISireName        string `json:"aiSireName"`
+		AISireCode        string `json:"aiSireCode"`
 		ExpectedBirthDate string `json:"expectedBirthDate"`
 		Notes             string `json:"notes"`
 	}
@@ -335,24 +353,21 @@ func (s *Server) handleCreateBreedingRecord(w http.ResponseWriter, r *http.Reque
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
 		return
 	}
-	fatherTag, ok := normalizeAnimalTag(in.FatherTagID)
-	if !ok {
-		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "fatherTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
-		return
-	}
-	if motherTag == fatherTag {
-		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId and fatherTagId must be different"})
-		return
-	}
 	in.MotherTagID = motherTag
-	in.FatherTagID = fatherTag
 	in.Species = strings.TrimSpace(in.Species)
 	in.Notes = strings.TrimSpace(in.Notes)
+	in.AISireSource = strings.TrimSpace(in.AISireSource)
+	in.AISireName = strings.TrimSpace(in.AISireName)
+	in.AISireCode = strings.TrimSpace(in.AISireCode)
 	if in.BreedingDate == "" {
 		in.BreedingDate = time.Now().Format("2006-01-02")
 	}
-	if in.MotherTagID == "" || in.FatherTagID == "" || in.Species == "" {
-		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId, fatherTagId, and species are required"})
+	if in.MotherTagID == "" || in.Species == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId and species are required"})
+		return
+	}
+	if speciesProfile(in.Species) == "poultry" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "poultry records must use the poultry breeding endpoint"})
 		return
 	}
 
@@ -361,29 +376,78 @@ func (s *Server) handleCreateBreedingRecord(w http.ResponseWriter, r *http.Reque
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "breedingDate must be YYYY-MM-DD"})
 		return
 	}
+	heatDate, err := optionalDate(in.HeatDate)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "heatDate must be YYYY-MM-DD"})
+		return
+	}
+	aiDate, err := optionalDate(in.AIDate)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "aiDate must be YYYY-MM-DD"})
+		return
+	}
 	expectedDate, err := optionalDate(in.ExpectedBirthDate)
 	if err != nil {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "expectedBirthDate must be YYYY-MM-DD"})
+		return
+	}
+	onHeat := false
+	if in.OnHeat != nil {
+		onHeat = *in.OnHeat
+	}
+	aiSource, ok := normalizeAISource(in.AISireSource)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "aiSireSource must be internal, external, or semen_batch"})
+		return
+	}
+	hasAIFields := aiDate != nil || in.AISireName != "" || in.AISireCode != ""
+	if hasAIFields && aiSource == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "aiSireSource is required when AI details are provided"})
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	var motherID, fatherID int64
+	var motherID int64
 	if err := s.db.QueryRow(ctx, `SELECT id FROM animals WHERE tag_id = $1 AND is_active = true`, in.MotherTagID).Scan(&motherID); err != nil {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "mother animal not found"})
 		return
 	}
-	if err := s.db.QueryRow(ctx, `SELECT id FROM animals WHERE tag_id = $1 AND is_active = true`, in.FatherTagID).Scan(&fatherID); err != nil {
-		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "father animal not found"})
-		return
+	var fatherID *int64
+	if strings.TrimSpace(in.FatherTagID) != "" {
+		fatherTag, ok := normalizeAnimalTag(in.FatherTagID)
+		if !ok {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "fatherTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+			return
+		}
+		if motherTag == fatherTag {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId and fatherTagId must be different"})
+			return
+		}
+		var father int64
+		if err := s.db.QueryRow(ctx, `SELECT id FROM animals WHERE tag_id = $1 AND is_active = true`, fatherTag).Scan(&father); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "father animal not found"})
+			return
+		}
+		fatherID = &father
+	}
+	if aiSource == "internal" || aiSource == "" {
+		if fatherID == nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "fatherTagId is required for natural or internal AI breeding"})
+			return
+		}
+	}
+	var aiSourcePtr *string
+	if aiSource != "" {
+		aiSourcePtr = &aiSource
 	}
 
 	_, err = s.db.Exec(ctx, `
-		INSERT INTO breeding_records(mother_animal_id, father_animal_id, species, breeding_date, expected_birth_date, status, notes)
-		VALUES ($1, $2, $3, $4, $5, 'active', $6)
-	`, motherID, fatherID, in.Species, breedDate, expectedDate, in.Notes)
+		INSERT INTO breeding_records(mother_animal_id, father_animal_id, species, breeding_date, heat_date, ai_date, on_heat,
+			ai_sire_source, ai_sire_name, ai_sire_code, expected_birth_date, status, notes)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'active', $12)
+	`, motherID, fatherID, in.Species, breedDate, heatDate, aiDate, onHeat, aiSourcePtr, in.AISireName, in.AISireCode, expectedDate, in.Notes)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create breeding record"})
 		return
@@ -404,6 +468,12 @@ func (s *Server) handleUpdateBreedingRecord(w http.ResponseWriter, r *http.Reque
 		FatherTagID       string `json:"fatherTagId"`
 		Species           string `json:"species"`
 		BreedingDate      string `json:"breedingDate"`
+		HeatDate          string `json:"heatDate"`
+		AIDate            string `json:"aiDate"`
+		OnHeat            *bool  `json:"onHeat"`
+		AISireSource      string `json:"aiSireSource"`
+		AISireName        string `json:"aiSireName"`
+		AISireCode        string `json:"aiSireCode"`
 		ExpectedBirthDate string `json:"expectedBirthDate"`
 		Status            string `json:"status"`
 		Notes             string `json:"notes"`
@@ -417,23 +487,20 @@ func (s *Server) handleUpdateBreedingRecord(w http.ResponseWriter, r *http.Reque
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
 		return
 	}
-	fatherTag, ok := normalizeAnimalTag(in.FatherTagID)
-	if !ok {
-		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "fatherTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
-		return
-	}
-	if motherTag == fatherTag {
-		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId and fatherTagId must be different"})
-		return
-	}
 	in.MotherTagID = motherTag
-	in.FatherTagID = fatherTag
 	in.Species = strings.TrimSpace(in.Species)
+	in.AISireSource = strings.TrimSpace(in.AISireSource)
+	in.AISireName = strings.TrimSpace(in.AISireName)
+	in.AISireCode = strings.TrimSpace(in.AISireCode)
 	if in.Status == "" {
 		in.Status = "active"
 	}
-	if in.MotherTagID == "" || in.FatherTagID == "" || in.Species == "" {
-		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId, fatherTagId, and species are required"})
+	if in.MotherTagID == "" || in.Species == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId and species are required"})
+		return
+	}
+	if speciesProfile(in.Species) == "poultry" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "poultry records must use the poultry breeding endpoint"})
 		return
 	}
 	breedingDate, err := time.Parse("2006-01-02", in.BreedingDate)
@@ -441,28 +508,77 @@ func (s *Server) handleUpdateBreedingRecord(w http.ResponseWriter, r *http.Reque
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "breedingDate must be YYYY-MM-DD"})
 		return
 	}
+	heatDate, err := optionalDate(in.HeatDate)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "heatDate must be YYYY-MM-DD"})
+		return
+	}
+	aiDate, err := optionalDate(in.AIDate)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "aiDate must be YYYY-MM-DD"})
+		return
+	}
 	expectedDate, err := optionalDate(in.ExpectedBirthDate)
 	if err != nil {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "expectedBirthDate must be YYYY-MM-DD"})
 		return
 	}
+	onHeat := false
+	if in.OnHeat != nil {
+		onHeat = *in.OnHeat
+	}
+	aiSource, ok := normalizeAISource(in.AISireSource)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "aiSireSource must be internal, external, or semen_batch"})
+		return
+	}
+	hasAIFields := aiDate != nil || in.AISireName != "" || in.AISireCode != ""
+	if hasAIFields && aiSource == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "aiSireSource is required when AI details are provided"})
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	var motherID, fatherID int64
+	var motherID int64
 	if err := s.db.QueryRow(ctx, `SELECT id FROM animals WHERE tag_id = $1`, in.MotherTagID).Scan(&motherID); err != nil {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "mother animal not found"})
 		return
 	}
-	if err := s.db.QueryRow(ctx, `SELECT id FROM animals WHERE tag_id = $1`, in.FatherTagID).Scan(&fatherID); err != nil {
-		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "father animal not found"})
-		return
+	var fatherID *int64
+	if strings.TrimSpace(in.FatherTagID) != "" {
+		fatherTag, ok := normalizeAnimalTag(in.FatherTagID)
+		if !ok {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "fatherTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+			return
+		}
+		if motherTag == fatherTag {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId and fatherTagId must be different"})
+			return
+		}
+		var father int64
+		if err := s.db.QueryRow(ctx, `SELECT id FROM animals WHERE tag_id = $1`, fatherTag).Scan(&father); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "father animal not found"})
+			return
+		}
+		fatherID = &father
+	}
+	if aiSource == "internal" || aiSource == "" {
+		if fatherID == nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "fatherTagId is required for natural or internal AI breeding"})
+			return
+		}
+	}
+	var aiSourcePtr *string
+	if aiSource != "" {
+		aiSourcePtr = &aiSource
 	}
 	res, err := s.db.Exec(ctx, `
 		UPDATE breeding_records
-		SET mother_animal_id = $1, father_animal_id = $2, species = $3, breeding_date = $4, expected_birth_date = $5, status = $6, notes = $7
-		WHERE id = $8
-	`, motherID, fatherID, in.Species, breedingDate, expectedDate, in.Status, strings.TrimSpace(in.Notes), recordID)
+		SET mother_animal_id = $1, father_animal_id = $2, species = $3, breeding_date = $4, heat_date = $5, ai_date = $6, on_heat = $7,
+			ai_sire_source = $8, ai_sire_name = $9, ai_sire_code = $10, expected_birth_date = $11, status = $12, notes = $13
+		WHERE id = $14
+	`, motherID, fatherID, in.Species, breedingDate, heatDate, aiDate, onHeat, aiSourcePtr, in.AISireName, in.AISireCode, expectedDate, in.Status, strings.TrimSpace(in.Notes), recordID)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update breeding record"})
 		return
@@ -485,6 +601,235 @@ func (s *Server) handleDeleteBreedingRecord(w http.ResponseWriter, r *http.Reque
 	res, err := s.db.Exec(ctx, `DELETE FROM breeding_records WHERE id = $1`, recordID)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete breeding record"})
+		return
+	}
+	if res.RowsAffected() == 0 {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "record not found"})
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleCreatePoultryBreedingRecord(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		HenTagID       string `json:"motherTagId"`
+		RoosterTagID   string `json:"fatherTagId"`
+		Species        string `json:"species"`
+		EggSetDate     string `json:"eggSetDate"`
+		HatchDate      string `json:"hatchDate"`
+		EggsSet        *int   `json:"eggsSet"`
+		ChicksHatched  *int   `json:"chicksHatched"`
+		Status         string `json:"status"`
+		Notes          string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
+		return
+	}
+	henTag, ok := normalizeAnimalTag(in.HenTagID)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+		return
+	}
+	in.HenTagID = henTag
+	in.Species = strings.TrimSpace(in.Species)
+	in.Notes = strings.TrimSpace(in.Notes)
+	if in.Species == "" {
+		in.Species = "Poultry"
+	}
+	if speciesProfile(in.Species) != "poultry" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "species must be a poultry type"})
+		return
+	}
+	if strings.TrimSpace(in.EggSetDate) == "" {
+		in.EggSetDate = time.Now().Format("2006-01-02")
+	}
+	eggSetDate, err := time.Parse("2006-01-02", in.EggSetDate)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "eggSetDate must be YYYY-MM-DD"})
+		return
+	}
+	hatchDate, err := optionalDate(in.HatchDate)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "hatchDate must be YYYY-MM-DD"})
+		return
+	}
+	eggsSet := 0
+	if in.EggsSet != nil {
+		eggsSet = *in.EggsSet
+	}
+	if eggsSet < 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "eggsSet must be 0 or greater"})
+		return
+	}
+	var chicksHatched *int
+	if in.ChicksHatched != nil {
+		if *in.ChicksHatched < 0 {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "chicksHatched must be 0 or greater"})
+			return
+		}
+		chicksHatched = in.ChicksHatched
+	}
+	if in.Status == "" {
+		in.Status = "active"
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	var henID int64
+	if err := s.db.QueryRow(ctx, `SELECT id FROM animals WHERE tag_id = $1 AND is_active = true`, in.HenTagID).Scan(&henID); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "hen animal not found"})
+		return
+	}
+	var roosterID *int64
+	if strings.TrimSpace(in.RoosterTagID) != "" {
+		roosterTag, ok := normalizeAnimalTag(in.RoosterTagID)
+		if !ok {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "fatherTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+			return
+		}
+		if roosterTag == henTag {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId and fatherTagId must be different"})
+			return
+		}
+		var rooster int64
+		if err := s.db.QueryRow(ctx, `SELECT id FROM animals WHERE tag_id = $1 AND is_active = true`, roosterTag).Scan(&rooster); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "rooster animal not found"})
+			return
+		}
+		roosterID = &rooster
+	}
+
+	_, err = s.db.Exec(ctx, `
+		INSERT INTO poultry_breeding_records(hen_animal_id, rooster_animal_id, species, egg_set_date, hatch_date, eggs_set, chicks_hatched, status, notes)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`, henID, roosterID, in.Species, eggSetDate, hatchDate, eggsSet, chicksHatched, in.Status, in.Notes)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create poultry breeding record"})
+		return
+	}
+	respondJSON(w, http.StatusCreated, map[string]any{"ok": true})
+}
+
+func (s *Server) handleUpdatePoultryBreedingRecord(w http.ResponseWriter, r *http.Request) {
+	recordID, err := parsePathID(r, "id")
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid record id"})
+		return
+	}
+	var in struct {
+		HenTagID       string `json:"motherTagId"`
+		RoosterTagID   string `json:"fatherTagId"`
+		Species        string `json:"species"`
+		EggSetDate     string `json:"eggSetDate"`
+		HatchDate      string `json:"hatchDate"`
+		EggsSet        *int   `json:"eggsSet"`
+		ChicksHatched  *int   `json:"chicksHatched"`
+		Status         string `json:"status"`
+		Notes          string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
+		return
+	}
+	henTag, ok := normalizeAnimalTag(in.HenTagID)
+	if !ok {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+		return
+	}
+	in.HenTagID = henTag
+	in.Species = strings.TrimSpace(in.Species)
+	in.Notes = strings.TrimSpace(in.Notes)
+	if in.Species == "" {
+		in.Species = "Poultry"
+	}
+	if speciesProfile(in.Species) != "poultry" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "species must be a poultry type"})
+		return
+	}
+	eggSetDate, err := time.Parse("2006-01-02", in.EggSetDate)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "eggSetDate must be YYYY-MM-DD"})
+		return
+	}
+	hatchDate, err := optionalDate(in.HatchDate)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "hatchDate must be YYYY-MM-DD"})
+		return
+	}
+	eggsSet := 0
+	if in.EggsSet != nil {
+		eggsSet = *in.EggsSet
+	}
+	if eggsSet < 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "eggsSet must be 0 or greater"})
+		return
+	}
+	var chicksHatched *int
+	if in.ChicksHatched != nil {
+		if *in.ChicksHatched < 0 {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "chicksHatched must be 0 or greater"})
+			return
+		}
+		chicksHatched = in.ChicksHatched
+	}
+	if in.Status == "" {
+		in.Status = "active"
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	var henID int64
+	if err := s.db.QueryRow(ctx, `SELECT id FROM animals WHERE tag_id = $1`, in.HenTagID).Scan(&henID); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "hen animal not found"})
+		return
+	}
+	var roosterID *int64
+	if strings.TrimSpace(in.RoosterTagID) != "" {
+		roosterTag, ok := normalizeAnimalTag(in.RoosterTagID)
+		if !ok {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "fatherTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+			return
+		}
+		if roosterTag == henTag {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "motherTagId and fatherTagId must be different"})
+			return
+		}
+		var rooster int64
+		if err := s.db.QueryRow(ctx, `SELECT id FROM animals WHERE tag_id = $1`, roosterTag).Scan(&rooster); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "rooster animal not found"})
+			return
+		}
+		roosterID = &rooster
+	}
+
+	res, err := s.db.Exec(ctx, `
+		UPDATE poultry_breeding_records
+		SET hen_animal_id = $1, rooster_animal_id = $2, species = $3, egg_set_date = $4, hatch_date = $5, eggs_set = $6, chicks_hatched = $7, status = $8, notes = $9
+		WHERE id = $10
+	`, henID, roosterID, in.Species, eggSetDate, hatchDate, eggsSet, chicksHatched, in.Status, in.Notes, recordID)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update poultry breeding record"})
+		return
+	}
+	if res.RowsAffected() == 0 {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "record not found"})
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleDeletePoultryBreedingRecord(w http.ResponseWriter, r *http.Request) {
+	recordID, err := parsePathID(r, "id")
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid record id"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	res, err := s.db.Exec(ctx, `DELETE FROM poultry_breeding_records WHERE id = $1`, recordID)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete poultry breeding record"})
 		return
 	}
 	if res.RowsAffected() == 0 {
@@ -551,19 +896,28 @@ func (s *Server) handleRecordBirth(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCreateProductionLog(w http.ResponseWriter, r *http.Request) {
 	const (
-		defaultMilkRate = 60.0
-		defaultEggRate  = 15.0
-		defaultWoolRate = 500.0
+		defaultMilkRate     = 60.0
+		defaultMilkCowRate  = 60.0
+		defaultMilkGoatRate = 80.0
+		defaultEggRate      = 15.0
+		defaultWoolRate     = 500.0
+		defaultMeatRate     = 450.0
 	)
 
 	var in struct {
 		Date                string   `json:"date"`
 		MilkLiters          *float64 `json:"milkLiters"`
+		MilkCowLiters       *float64 `json:"milkCowLiters"`
+		MilkGoatLiters      *float64 `json:"milkGoatLiters"`
 		EggsCount           *int     `json:"eggsCount"`
 		WoolKg              *float64 `json:"woolKg"`
+		MeatKg              *float64 `json:"meatKg"`
 		MilkRate            *float64 `json:"milkRate"`
+		MilkCowRate         *float64 `json:"milkCowRate"`
+		MilkGoatRate        *float64 `json:"milkGoatRate"`
 		EggRate             *float64 `json:"eggRate"`
 		WoolRate            *float64 `json:"woolRate"`
+		MeatRate            *float64 `json:"meatRate"`
 		TotalValue          *float64 `json:"totalValue"`
 		ManualTotalOverride bool     `json:"manualTotalOverride"`
 	}
@@ -580,14 +934,26 @@ func (s *Server) handleCreateProductionLog(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	milk := 0.0
+	milkCow := 0.0
+	milkGoat := 0.0
 	eggs := 0
 	wool := 0.0
+	meat := 0.0
 	milkRate := defaultMilkRate
+	milkCowRate := defaultMilkCowRate
+	milkGoatRate := defaultMilkGoatRate
 	eggRate := defaultEggRate
 	woolRate := defaultWoolRate
+	meatRate := defaultMeatRate
 	totalValue := 0.0
 	if in.MilkLiters != nil {
 		milk = *in.MilkLiters
+	}
+	if in.MilkCowLiters != nil {
+		milkCow = *in.MilkCowLiters
+	}
+	if in.MilkGoatLiters != nil {
+		milkGoat = *in.MilkGoatLiters
 	}
 	if in.EggsCount != nil {
 		eggs = *in.EggsCount
@@ -595,8 +961,17 @@ func (s *Server) handleCreateProductionLog(w http.ResponseWriter, r *http.Reques
 	if in.WoolKg != nil {
 		wool = *in.WoolKg
 	}
+	if in.MeatKg != nil {
+		meat = *in.MeatKg
+	}
 	if in.MilkRate != nil {
 		milkRate = *in.MilkRate
+	}
+	if in.MilkCowRate != nil {
+		milkCowRate = *in.MilkCowRate
+	}
+	if in.MilkGoatRate != nil {
+		milkGoatRate = *in.MilkGoatRate
 	}
 	if in.EggRate != nil {
 		eggRate = *in.EggRate
@@ -604,7 +979,16 @@ func (s *Server) handleCreateProductionLog(w http.ResponseWriter, r *http.Reques
 	if in.WoolRate != nil {
 		woolRate = *in.WoolRate
 	}
-	if milk < 0 || eggs < 0 || wool < 0 || milkRate < 0 || eggRate < 0 || woolRate < 0 {
+	if in.MeatRate != nil {
+		meatRate = *in.MeatRate
+	}
+
+	milkTotalFromVariants := milkCow + milkGoat
+	if milkTotalFromVariants > 0 {
+		milk = milkTotalFromVariants
+	}
+
+	if milk < 0 || milkCow < 0 || milkGoat < 0 || eggs < 0 || wool < 0 || meat < 0 || milkRate < 0 || milkCowRate < 0 || milkGoatRate < 0 || eggRate < 0 || woolRate < 0 || meatRate < 0 {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "production values cannot be negative"})
 		return
 	}
@@ -615,20 +999,28 @@ func (s *Server) handleCreateProductionLog(w http.ResponseWriter, r *http.Reques
 		}
 		totalValue = *in.TotalValue
 	} else {
-		totalValue = milk*milkRate + float64(eggs)*eggRate + wool*woolRate
+		if milkTotalFromVariants > 0 {
+			totalValue = milkCow*milkCowRate + milkGoat*milkGoatRate
+		} else {
+			totalValue = milk * milkRate
+		}
+		totalValue += float64(eggs)*eggRate + wool*woolRate + meat*meatRate
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	_, err = s.db.Exec(ctx, `
-		INSERT INTO production_logs(log_date, milk_liters, eggs_count, wool_kg, total_value)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO production_logs(log_date, milk_liters, milk_cow_liters, milk_goat_liters, eggs_count, wool_kg, meat_kg, total_value)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (log_date) DO UPDATE
 		SET milk_liters = EXCLUDED.milk_liters,
+			milk_cow_liters = EXCLUDED.milk_cow_liters,
+			milk_goat_liters = EXCLUDED.milk_goat_liters,
 			eggs_count = EXCLUDED.eggs_count,
 			wool_kg = EXCLUDED.wool_kg,
+			meat_kg = EXCLUDED.meat_kg,
 			total_value = EXCLUDED.total_value
-	`, d, milk, eggs, wool, totalValue)
+	`, d, milk, milkCow, milkGoat, eggs, wool, meat, totalValue)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create production log"})
 		return
@@ -638,9 +1030,12 @@ func (s *Server) handleCreateProductionLog(w http.ResponseWriter, r *http.Reques
 
 func (s *Server) handleUpdateProductionLog(w http.ResponseWriter, r *http.Request) {
 	const (
-		defaultMilkRate = 60.0
-		defaultEggRate  = 15.0
-		defaultWoolRate = 500.0
+		defaultMilkRate     = 60.0
+		defaultMilkCowRate  = 60.0
+		defaultMilkGoatRate = 80.0
+		defaultEggRate      = 15.0
+		defaultWoolRate     = 500.0
+		defaultMeatRate     = 450.0
 	)
 
 	logID, err := parsePathID(r, "id")
@@ -651,11 +1046,17 @@ func (s *Server) handleUpdateProductionLog(w http.ResponseWriter, r *http.Reques
 	var in struct {
 		Date                string   `json:"date"`
 		MilkLiters          float64  `json:"milkLiters"`
+		MilkCowLiters       float64  `json:"milkCowLiters"`
+		MilkGoatLiters      float64  `json:"milkGoatLiters"`
 		EggsCount           int      `json:"eggsCount"`
 		WoolKg              float64  `json:"woolKg"`
+		MeatKg              float64  `json:"meatKg"`
 		MilkRate            *float64 `json:"milkRate"`
+		MilkCowRate         *float64 `json:"milkCowRate"`
+		MilkGoatRate        *float64 `json:"milkGoatRate"`
 		EggRate             *float64 `json:"eggRate"`
 		WoolRate            *float64 `json:"woolRate"`
+		MeatRate            *float64 `json:"meatRate"`
 		TotalValue          float64  `json:"totalValue"`
 		ManualTotalOverride bool     `json:"manualTotalOverride"`
 	}
@@ -669,10 +1070,19 @@ func (s *Server) handleUpdateProductionLog(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	milkRate := defaultMilkRate
+	milkCowRate := defaultMilkCowRate
+	milkGoatRate := defaultMilkGoatRate
 	eggRate := defaultEggRate
 	woolRate := defaultWoolRate
+	meatRate := defaultMeatRate
 	if in.MilkRate != nil {
 		milkRate = *in.MilkRate
+	}
+	if in.MilkCowRate != nil {
+		milkCowRate = *in.MilkCowRate
+	}
+	if in.MilkGoatRate != nil {
+		milkGoatRate = *in.MilkGoatRate
 	}
 	if in.EggRate != nil {
 		eggRate = *in.EggRate
@@ -680,7 +1090,16 @@ func (s *Server) handleUpdateProductionLog(w http.ResponseWriter, r *http.Reques
 	if in.WoolRate != nil {
 		woolRate = *in.WoolRate
 	}
-	if in.MilkLiters < 0 || in.EggsCount < 0 || in.WoolKg < 0 || milkRate < 0 || eggRate < 0 || woolRate < 0 {
+	if in.MeatRate != nil {
+		meatRate = *in.MeatRate
+	}
+
+	milkTotalFromVariants := in.MilkCowLiters + in.MilkGoatLiters
+	if milkTotalFromVariants > 0 {
+		in.MilkLiters = milkTotalFromVariants
+	}
+
+	if in.MilkLiters < 0 || in.MilkCowLiters < 0 || in.MilkGoatLiters < 0 || in.EggsCount < 0 || in.WoolKg < 0 || in.MeatKg < 0 || milkRate < 0 || milkCowRate < 0 || milkGoatRate < 0 || eggRate < 0 || woolRate < 0 || meatRate < 0 {
 		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "production values cannot be negative"})
 		return
 	}
@@ -691,15 +1110,21 @@ func (s *Server) handleUpdateProductionLog(w http.ResponseWriter, r *http.Reques
 			return
 		}
 	} else {
-		totalValue = in.MilkLiters*milkRate + float64(in.EggsCount)*eggRate + in.WoolKg*woolRate
+		if milkTotalFromVariants > 0 {
+			totalValue = in.MilkCowLiters*milkCowRate + in.MilkGoatLiters*milkGoatRate
+		} else {
+			totalValue = in.MilkLiters * milkRate
+		}
+		totalValue += float64(in.EggsCount)*eggRate + in.WoolKg*woolRate + in.MeatKg*meatRate
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 	res, err := s.db.Exec(ctx, `
 		UPDATE production_logs
-		SET log_date = $1, milk_liters = $2, eggs_count = $3, wool_kg = $4, total_value = $5
-		WHERE id = $6
-	`, d, in.MilkLiters, in.EggsCount, in.WoolKg, totalValue, logID)
+		SET log_date = $1, milk_liters = $2, milk_cow_liters = $3, milk_goat_liters = $4,
+			eggs_count = $5, wool_kg = $6, meat_kg = $7, total_value = $8
+		WHERE id = $9
+	`, d, in.MilkLiters, in.MilkCowLiters, in.MilkGoatLiters, in.EggsCount, in.WoolKg, in.MeatKg, totalValue, logID)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update production log"})
 		return
@@ -774,6 +1199,619 @@ func (s *Server) handleCreateExpense(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, http.StatusCreated, map[string]any{"ok": true})
+}
+
+func (s *Server) handleCreateFeedingRecord(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Date         string  `json:"date"`
+		AnimalTagID  string  `json:"animalTagId"`
+		RationID     *int64  `json:"rationId"`
+		PlanID       *int64  `json:"planId"`
+		FeedType     string  `json:"feedType"`
+		QuantityValue float64 `json:"quantityValue"`
+		QuantityUnit string  `json:"quantityUnit"`
+		Supplier     string  `json:"supplier"`
+		Cost         float64 `json:"cost"`
+		Notes        string  `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
+		return
+	}
+
+	in.FeedType = strings.TrimSpace(in.FeedType)
+	in.QuantityUnit = strings.TrimSpace(in.QuantityUnit)
+	in.Supplier = strings.TrimSpace(in.Supplier)
+	in.Notes = strings.TrimSpace(in.Notes)
+	if in.Date == "" {
+		in.Date = time.Now().Format("2006-01-02")
+	}
+	if in.QuantityUnit == "" {
+		in.QuantityUnit = "kg"
+	}
+	if in.FeedType == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "feedType is required"})
+		return
+	}
+	if in.QuantityValue < 0 || in.Cost < 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "quantityValue and cost must be non-negative"})
+		return
+	}
+
+	feedDate, err := time.Parse("2006-01-02", in.Date)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "date must be YYYY-MM-DD"})
+		return
+	}
+
+	var animalID *int64
+	if strings.TrimSpace(in.AnimalTagID) != "" {
+		tagID, ok := normalizeAnimalTag(in.AnimalTagID)
+		if !ok {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "animalTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+			return
+		}
+		in.AnimalTagID = tagID
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		var id int64
+		if err := s.db.QueryRow(ctx, `SELECT id FROM animals WHERE tag_id = $1 AND is_active = true`, in.AnimalTagID).Scan(&id); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "animal not found"})
+			return
+		}
+		animalID = &id
+	}
+
+	var rationID *int64
+	if in.RationID != nil && *in.RationID > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		var id int64
+		if err := s.db.QueryRow(ctx, `SELECT id FROM feeding_rations WHERE id = $1`, *in.RationID).Scan(&id); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "ration not found"})
+			return
+		}
+		rationID = &id
+	}
+
+	var planID *int64
+	if in.PlanID != nil && *in.PlanID > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		var id int64
+		if err := s.db.QueryRow(ctx, `SELECT id FROM feeding_plans WHERE id = $1`, *in.PlanID).Scan(&id); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "feeding plan not found"})
+			return
+		}
+		planID = &id
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	_, err = s.db.Exec(ctx, `
+		INSERT INTO feeding_records(feed_date, animal_id, ration_id, plan_id, feed_type, quantity_value, quantity_unit, supplier, cost, notes)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, feedDate, animalID, rationID, planID, in.FeedType, in.QuantityValue, in.QuantityUnit, in.Supplier, in.Cost, in.Notes)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create feeding record"})
+		return
+	}
+	respondJSON(w, http.StatusCreated, map[string]any{"ok": true})
+}
+
+func (s *Server) handleUpdateFeedingRecord(w http.ResponseWriter, r *http.Request) {
+	recordID, err := parsePathID(r, "id")
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid record id"})
+		return
+	}
+
+	var in struct {
+		Date         string  `json:"date"`
+		AnimalTagID  string  `json:"animalTagId"`
+		RationID     *int64  `json:"rationId"`
+		PlanID       *int64  `json:"planId"`
+		FeedType     string  `json:"feedType"`
+		QuantityValue float64 `json:"quantityValue"`
+		QuantityUnit string  `json:"quantityUnit"`
+		Supplier     string  `json:"supplier"`
+		Cost         float64 `json:"cost"`
+		Notes        string  `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
+		return
+	}
+
+	in.FeedType = strings.TrimSpace(in.FeedType)
+	in.QuantityUnit = strings.TrimSpace(in.QuantityUnit)
+	in.Supplier = strings.TrimSpace(in.Supplier)
+	in.Notes = strings.TrimSpace(in.Notes)
+	if in.QuantityUnit == "" {
+		in.QuantityUnit = "kg"
+	}
+	if in.FeedType == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "feedType is required"})
+		return
+	}
+	if in.QuantityValue < 0 || in.Cost < 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "quantityValue and cost must be non-negative"})
+		return
+	}
+	feedDate, err := time.Parse("2006-01-02", in.Date)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "date must be YYYY-MM-DD"})
+		return
+	}
+
+	var animalID *int64
+	if strings.TrimSpace(in.AnimalTagID) != "" {
+		tagID, ok := normalizeAnimalTag(in.AnimalTagID)
+		if !ok {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "animalTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+			return
+		}
+		in.AnimalTagID = tagID
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		var id int64
+		if err := s.db.QueryRow(ctx, `SELECT id FROM animals WHERE tag_id = $1`, in.AnimalTagID).Scan(&id); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "animal not found"})
+			return
+		}
+		animalID = &id
+	}
+
+	var rationID *int64
+	if in.RationID != nil && *in.RationID > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		var id int64
+		if err := s.db.QueryRow(ctx, `SELECT id FROM feeding_rations WHERE id = $1`, *in.RationID).Scan(&id); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "ration not found"})
+			return
+		}
+		rationID = &id
+	}
+
+	var planID *int64
+	if in.PlanID != nil && *in.PlanID > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		var id int64
+		if err := s.db.QueryRow(ctx, `SELECT id FROM feeding_plans WHERE id = $1`, *in.PlanID).Scan(&id); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "feeding plan not found"})
+			return
+		}
+		planID = &id
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	res, err := s.db.Exec(ctx, `
+		UPDATE feeding_records
+		SET feed_date = $1, animal_id = $2, ration_id = $3, plan_id = $4, feed_type = $5, quantity_value = $6, quantity_unit = $7, supplier = $8, cost = $9, notes = $10
+		WHERE id = $11
+	`, feedDate, animalID, rationID, planID, in.FeedType, in.QuantityValue, in.QuantityUnit, in.Supplier, in.Cost, in.Notes, recordID)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update feeding record"})
+		return
+	}
+	if res.RowsAffected() == 0 {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "record not found"})
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleDeleteFeedingRecord(w http.ResponseWriter, r *http.Request) {
+	recordID, err := parsePathID(r, "id")
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid record id"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	res, err := s.db.Exec(ctx, `DELETE FROM feeding_records WHERE id = $1`, recordID)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete feeding record"})
+		return
+	}
+	if res.RowsAffected() == 0 {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "record not found"})
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleCreateFeedingRation(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name    string `json:"name"`
+		Species string `json:"species"`
+		State   string `json:"state"`
+		Notes   string `json:"notes"`
+		Items   []struct {
+			Ingredient string  `json:"ingredient"`
+			Quantity   float64 `json:"quantity"`
+			Unit       string  `json:"unit"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
+		return
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	in.Species = strings.TrimSpace(in.Species)
+	in.State = strings.TrimSpace(in.State)
+	in.Notes = strings.TrimSpace(in.Notes)
+	if in.Name == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create ration"})
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	var rationID int64
+	if err := tx.QueryRow(ctx, `
+		INSERT INTO feeding_rations(name, species, state, notes)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id
+	`, in.Name, in.Species, in.State, in.Notes).Scan(&rationID); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create ration"})
+		return
+	}
+
+	for _, item := range in.Items {
+		ingredient := strings.TrimSpace(item.Ingredient)
+		unit := strings.TrimSpace(item.Unit)
+		if ingredient == "" {
+			continue
+		}
+		if unit == "" {
+			unit = "kg"
+		}
+		if item.Quantity < 0 {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "ration item quantity must be non-negative"})
+			return
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO feeding_ration_items(ration_id, ingredient, quantity_value, quantity_unit)
+			VALUES ($1, $2, $3, $4)
+		`, rationID, ingredient, item.Quantity, unit); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create ration items"})
+			return
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create ration"})
+		return
+	}
+	respondJSON(w, http.StatusCreated, map[string]any{"ok": true})
+}
+
+func (s *Server) handleUpdateFeedingRation(w http.ResponseWriter, r *http.Request) {
+	rationID, err := parsePathID(r, "id")
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid ration id"})
+		return
+	}
+
+	var in struct {
+		Name    string `json:"name"`
+		Species string `json:"species"`
+		State   string `json:"state"`
+		Notes   string `json:"notes"`
+		Items   []struct {
+			Ingredient string  `json:"ingredient"`
+			Quantity   float64 `json:"quantity"`
+			Unit       string  `json:"unit"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
+		return
+	}
+	in.Name = strings.TrimSpace(in.Name)
+	in.Species = strings.TrimSpace(in.Species)
+	in.State = strings.TrimSpace(in.State)
+	in.Notes = strings.TrimSpace(in.Notes)
+	if in.Name == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update ration"})
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	res, err := tx.Exec(ctx, `
+		UPDATE feeding_rations
+		SET name = $1, species = $2, state = $3, notes = $4
+		WHERE id = $5
+	`, in.Name, in.Species, in.State, in.Notes, rationID)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update ration"})
+		return
+	}
+	if res.RowsAffected() == 0 {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "ration not found"})
+		return
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM feeding_ration_items WHERE ration_id = $1`, rationID); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update ration items"})
+		return
+	}
+	for _, item := range in.Items {
+		ingredient := strings.TrimSpace(item.Ingredient)
+		unit := strings.TrimSpace(item.Unit)
+		if ingredient == "" {
+			continue
+		}
+		if unit == "" {
+			unit = "kg"
+		}
+		if item.Quantity < 0 {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "ration item quantity must be non-negative"})
+			return
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO feeding_ration_items(ration_id, ingredient, quantity_value, quantity_unit)
+			VALUES ($1, $2, $3, $4)
+		`, rationID, ingredient, item.Quantity, unit); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update ration items"})
+			return
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update ration"})
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleDeleteFeedingRation(w http.ResponseWriter, r *http.Request) {
+	rationID, err := parsePathID(r, "id")
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid ration id"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	res, err := s.db.Exec(ctx, `DELETE FROM feeding_rations WHERE id = $1`, rationID)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete ration"})
+		return
+	}
+	if res.RowsAffected() == 0 {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "ration not found"})
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleCreateFeedingPlan(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		AnimalTagID       string  `json:"animalTagId"`
+		RationID          *int64  `json:"rationId"`
+		AnimalState       string  `json:"state"`
+		DailyQuantityValue float64 `json:"dailyQuantityValue"`
+		DailyQuantityUnit string  `json:"dailyQuantityUnit"`
+		StartDate         string  `json:"startDate"`
+		EndDate           string  `json:"endDate"`
+		Status            string  `json:"status"`
+		Notes             string  `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
+		return
+	}
+	in.AnimalState = strings.TrimSpace(in.AnimalState)
+	in.DailyQuantityUnit = strings.TrimSpace(in.DailyQuantityUnit)
+	in.Status = strings.TrimSpace(in.Status)
+	in.Notes = strings.TrimSpace(in.Notes)
+	if in.DailyQuantityUnit == "" {
+		in.DailyQuantityUnit = "kg"
+	}
+	if in.StartDate == "" {
+		in.StartDate = time.Now().Format("2006-01-02")
+	}
+	if in.Status == "" {
+		in.Status = "active"
+	}
+	if in.DailyQuantityValue < 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "dailyQuantityValue must be non-negative"})
+		return
+	}
+	if in.Status != "active" && in.Status != "paused" && in.Status != "completed" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "status must be active, paused, or completed"})
+		return
+	}
+	startDate, err := time.Parse("2006-01-02", in.StartDate)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "startDate must be YYYY-MM-DD"})
+		return
+	}
+	endDate, err := optionalDate(in.EndDate)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "endDate must be YYYY-MM-DD"})
+		return
+	}
+
+	var animalID *int64
+	if strings.TrimSpace(in.AnimalTagID) != "" {
+		tagID, ok := normalizeAnimalTag(in.AnimalTagID)
+		if !ok {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "animalTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+			return
+		}
+		in.AnimalTagID = tagID
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		var id int64
+		if err := s.db.QueryRow(ctx, `SELECT id FROM animals WHERE tag_id = $1 AND is_active = true`, in.AnimalTagID).Scan(&id); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "animal not found"})
+			return
+		}
+		animalID = &id
+	}
+
+	var rationID *int64
+	if in.RationID != nil && *in.RationID > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		var id int64
+		if err := s.db.QueryRow(ctx, `SELECT id FROM feeding_rations WHERE id = $1`, *in.RationID).Scan(&id); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "ration not found"})
+			return
+		}
+		rationID = &id
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	_, err = s.db.Exec(ctx, `
+		INSERT INTO feeding_plans(animal_id, ration_id, animal_state, daily_quantity_value, daily_quantity_unit, start_date, end_date, status, notes)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`, animalID, rationID, in.AnimalState, in.DailyQuantityValue, in.DailyQuantityUnit, startDate, endDate, in.Status, in.Notes)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create feeding plan"})
+		return
+	}
+	respondJSON(w, http.StatusCreated, map[string]any{"ok": true})
+}
+
+func (s *Server) handleUpdateFeedingPlan(w http.ResponseWriter, r *http.Request) {
+	planID, err := parsePathID(r, "id")
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid plan id"})
+		return
+	}
+
+	var in struct {
+		AnimalTagID       string  `json:"animalTagId"`
+		RationID          *int64  `json:"rationId"`
+		AnimalState       string  `json:"state"`
+		DailyQuantityValue float64 `json:"dailyQuantityValue"`
+		DailyQuantityUnit string  `json:"dailyQuantityUnit"`
+		StartDate         string  `json:"startDate"`
+		EndDate           string  `json:"endDate"`
+		Status            string  `json:"status"`
+		Notes             string  `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request payload"})
+		return
+	}
+	in.AnimalState = strings.TrimSpace(in.AnimalState)
+	in.DailyQuantityUnit = strings.TrimSpace(in.DailyQuantityUnit)
+	in.Status = strings.TrimSpace(in.Status)
+	in.Notes = strings.TrimSpace(in.Notes)
+	if in.DailyQuantityUnit == "" {
+		in.DailyQuantityUnit = "kg"
+	}
+	if in.Status == "" {
+		in.Status = "active"
+	}
+	if in.DailyQuantityValue < 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "dailyQuantityValue must be non-negative"})
+		return
+	}
+	if in.Status != "active" && in.Status != "paused" && in.Status != "completed" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "status must be active, paused, or completed"})
+		return
+	}
+	startDate, err := time.Parse("2006-01-02", in.StartDate)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "startDate must be YYYY-MM-DD"})
+		return
+	}
+	endDate, err := optionalDate(in.EndDate)
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "endDate must be YYYY-MM-DD"})
+		return
+	}
+
+	var animalID *int64
+	if strings.TrimSpace(in.AnimalTagID) != "" {
+		tagID, ok := normalizeAnimalTag(in.AnimalTagID)
+		if !ok {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "animalTagId must be 2-24 chars (A-Z, 0-9, hyphen)"})
+			return
+		}
+		in.AnimalTagID = tagID
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		var id int64
+		if err := s.db.QueryRow(ctx, `SELECT id FROM animals WHERE tag_id = $1`, in.AnimalTagID).Scan(&id); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "animal not found"})
+			return
+		}
+		animalID = &id
+	}
+
+	var rationID *int64
+	if in.RationID != nil && *in.RationID > 0 {
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		var id int64
+		if err := s.db.QueryRow(ctx, `SELECT id FROM feeding_rations WHERE id = $1`, *in.RationID).Scan(&id); err != nil {
+			respondJSON(w, http.StatusBadRequest, map[string]string{"error": "ration not found"})
+			return
+		}
+		rationID = &id
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	res, err := s.db.Exec(ctx, `
+		UPDATE feeding_plans
+		SET animal_id = $1, ration_id = $2, animal_state = $3, daily_quantity_value = $4, daily_quantity_unit = $5, start_date = $6, end_date = $7, status = $8, notes = $9
+		WHERE id = $10
+	`, animalID, rationID, in.AnimalState, in.DailyQuantityValue, in.DailyQuantityUnit, startDate, endDate, in.Status, in.Notes, planID)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to update feeding plan"})
+		return
+	}
+	if res.RowsAffected() == 0 {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "plan not found"})
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) handleDeleteFeedingPlan(w http.ResponseWriter, r *http.Request) {
+	planID, err := parsePathID(r, "id")
+	if err != nil {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid plan id"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	res, err := s.db.Exec(ctx, `DELETE FROM feeding_plans WHERE id = $1`, planID)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to delete feeding plan"})
+		return
+	}
+	if res.RowsAffected() == 0 {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "plan not found"})
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleUpdateExpense(w http.ResponseWriter, r *http.Request) {
@@ -1352,4 +2390,21 @@ func optionalDate(input string) (*time.Time, error) {
 
 func parsePathID(r *http.Request, field string) (int64, error) {
 	return strconv.ParseInt(strings.TrimSpace(r.PathValue(field)), 10, 64)
+}
+
+func normalizeAISource(input string) (string, bool) {
+	v := strings.ToLower(strings.TrimSpace(input))
+	if v == "" {
+		return "", true
+	}
+	switch v {
+	case "internal":
+		return "internal", true
+	case "external":
+		return "external", true
+	case "semen", "semen_batch", "semenbatch":
+		return "semen_batch", true
+	default:
+		return "", false
+	}
 }

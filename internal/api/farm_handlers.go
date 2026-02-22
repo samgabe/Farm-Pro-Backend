@@ -24,6 +24,52 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		WHERE DATE_TRUNC('month', sale_date) = DATE_TRUNC('month', CURRENT_DATE)
 	`).Scan(&monthlyGrossRevenue, &monthlyNetRevenue, &monthlyVATCollected)
 
+	typeCounts := make([]map[string]any, 0)
+	rows, err := s.db.Query(ctx, `
+		SELECT type, COUNT(*)
+		FROM animals
+		WHERE is_active = true
+		GROUP BY type
+		ORDER BY type
+	`)
+	if err == nil {
+		for rows.Next() {
+			var typ string
+			var count int64
+			if err := rows.Scan(&typ, &count); err != nil {
+				break
+			}
+			typeCounts = append(typeCounts, map[string]any{
+				"type":  typ,
+				"count": count,
+			})
+		}
+		rows.Close()
+	}
+
+	typeAttention := make([]map[string]any, 0)
+	rows, err = s.db.Query(ctx, `
+		SELECT type, COUNT(*)
+		FROM animals
+		WHERE is_active = true AND health_status <> 'healthy'
+		GROUP BY type
+		ORDER BY type
+	`)
+	if err == nil {
+		for rows.Next() {
+			var typ string
+			var count int64
+			if err := rows.Scan(&typ, &count); err != nil {
+				break
+			}
+			typeAttention = append(typeAttention, map[string]any{
+				"type":  typ,
+				"count": count,
+			})
+		}
+		rows.Close()
+	}
+
 	respondJSON(w, http.StatusOK, map[string]any{
 		"totalAnimals":         totalAnimals,
 		"sickAnimals":          sickAnimals,
@@ -32,6 +78,8 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		"monthlyGrossRevenue":  monthlyGrossRevenue,
 		"monthlyNetRevenue":    monthlyNetRevenue,
 		"monthlyVATCollected":  monthlyVATCollected,
+		"animalTypeCounts":     typeCounts,
+		"animalTypeAttention":  typeAttention,
 	})
 }
 
@@ -196,12 +244,13 @@ func (s *Server) handleBreedingActive(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	rows, err := s.db.Query(ctx, `
-		SELECT b.id, m.tag_id, f.tag_id, b.species, b.breeding_date, b.expected_birth_date, COALESCE(b.notes, '')
+		SELECT b.id, m.tag_id, COALESCE(f.tag_id, ''), b.species, b.breeding_date, b.heat_date, b.ai_date, b.on_heat,
+			b.ai_sire_source, COALESCE(b.ai_sire_name, ''), COALESCE(b.ai_sire_code, ''), b.expected_birth_date, COALESCE(b.notes, '')
 		FROM breeding_records b
 		JOIN animals m ON m.id = b.mother_animal_id
-		JOIN animals f ON f.id = b.father_animal_id
-		WHERE b.status = 'active' AND b.expected_birth_date IS NOT NULL
-		ORDER BY b.expected_birth_date
+		LEFT JOIN animals f ON f.id = b.father_animal_id
+		WHERE b.status = 'active'
+		ORDER BY COALESCE(b.expected_birth_date, b.breeding_date) DESC
 	`)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load breeding records"})
@@ -213,22 +262,44 @@ func (s *Server) handleBreedingActive(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id int64
 		var mother, father, species, notes string
-		var breedDate, expected time.Time
-		if err := rows.Scan(&id, &mother, &father, &species, &breedDate, &expected, &notes); err != nil {
+		var aiSource, aiName, aiCode string
+		var breedDate time.Time
+		var heatDate, aiDate, expected *time.Time
+		var onHeat bool
+		if err := rows.Scan(&id, &mother, &father, &species, &breedDate, &heatDate, &aiDate, &onHeat, &aiSource, &aiName, &aiCode, &expected, &notes); err != nil {
 			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse breeding records"})
 			return
 		}
 
-		totalDays := int(expected.Sub(breedDate).Hours() / 24)
-		elapsed := int(time.Since(breedDate).Hours() / 24)
 		progress := 0
-		if totalDays > 0 {
-			progress = int(math.Max(0, math.Min(100, float64(elapsed*100)/float64(totalDays))))
+		daysRemaining := 0
+		if expected != nil {
+			totalDays := int(expected.Sub(breedDate).Hours() / 24)
+			elapsed := int(time.Since(breedDate).Hours() / 24)
+			if totalDays > 0 {
+				progress = int(math.Max(0, math.Min(100, float64(elapsed*100)/float64(totalDays))))
+			}
+			daysRemaining = int(time.Until(*expected).Hours() / 24)
+			if daysRemaining < 0 {
+				daysRemaining = 0
+			}
 		}
 
-		daysRemaining := int(time.Until(expected).Hours() / 24)
-		if daysRemaining < 0 {
-			daysRemaining = 0
+		heatOut := ""
+		if heatDate != nil {
+			heatOut = s.formatDate(*heatDate)
+		}
+		aiOut := ""
+		if aiDate != nil {
+			aiOut = s.formatDate(*aiDate)
+		}
+		expectedOut := ""
+		if expected != nil {
+			expectedOut = s.formatDate(*expected)
+		}
+		remainingOut := "N/A"
+		if expected != nil {
+			remainingOut = fmt.Sprintf("%d days", daysRemaining)
 		}
 
 		out = append(out, map[string]any{
@@ -237,10 +308,67 @@ func (s *Server) handleBreedingActive(w http.ResponseWriter, r *http.Request) {
 			"father":    father,
 			"animal":    species,
 			"breedDate": s.formatDate(breedDate),
-			"expected":  s.formatDate(expected),
-			"days":      fmt.Sprintf("%d days", daysRemaining),
+			"heatDate":  heatOut,
+			"aiDate":    aiOut,
+			"onHeat":    onHeat,
+			"aiSource":  aiSource,
+			"aiName":    aiName,
+			"aiCode":    aiCode,
+			"expected":  expectedOut,
+			"days":      remainingOut,
 			"progress":  progress,
 			"notes":     notes,
+		})
+	}
+
+	respondJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleBreedingPoultryActive(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	rows, err := s.db.Query(ctx, `
+		SELECT p.id, h.tag_id, COALESCE(r.tag_id, ''), p.species, p.egg_set_date, p.hatch_date,
+			p.eggs_set, COALESCE(p.chicks_hatched, 0), p.status, COALESCE(p.notes, '')
+		FROM poultry_breeding_records p
+		JOIN animals h ON h.id = p.hen_animal_id
+		LEFT JOIN animals r ON r.id = p.rooster_animal_id
+		WHERE p.status = 'active'
+		ORDER BY p.egg_set_date DESC
+	`)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load poultry breeding records"})
+		return
+	}
+	defer rows.Close()
+
+	out := make([]map[string]any, 0)
+	for rows.Next() {
+		var id int64
+		var hen, rooster, species, status, notes string
+		var eggSet time.Time
+		var hatch *time.Time
+		var eggsSet, chicksHatched int
+		if err := rows.Scan(&id, &hen, &rooster, &species, &eggSet, &hatch, &eggsSet, &chicksHatched, &status, &notes); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse poultry breeding records"})
+			return
+		}
+		hatchOut := ""
+		if hatch != nil {
+			hatchOut = s.formatDate(*hatch)
+		}
+		out = append(out, map[string]any{
+			"id":            id,
+			"hen":           hen,
+			"rooster":       rooster,
+			"species":       species,
+			"eggSetDate":    s.formatDate(eggSet),
+			"hatchDate":     hatchOut,
+			"eggsSet":       eggsSet,
+			"chicksHatched": chicksHatched,
+			"status":        status,
+			"notes":         notes,
 		})
 	}
 
@@ -290,12 +418,20 @@ func (s *Server) handleProductionSummary(w http.ResponseWriter, r *http.Request)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	var milk, eggs, wool, value float64
+	var milk, eggs, wool, meat, value float64
+	var milkCow, milkGoat float64
 	err := s.db.QueryRow(ctx, `
-		SELECT COALESCE(SUM(milk_liters),0), COALESCE(SUM(eggs_count),0), COALESCE(SUM(wool_kg),0), COALESCE(SUM(total_value),0)
+		SELECT
+			COALESCE(SUM(milk_liters),0),
+			COALESCE(SUM(milk_cow_liters),0),
+			COALESCE(SUM(milk_goat_liters),0),
+			COALESCE(SUM(eggs_count),0),
+			COALESCE(SUM(wool_kg),0),
+			COALESCE(SUM(meat_kg),0),
+			COALESCE(SUM(total_value),0)
 		FROM production_logs
 		WHERE log_date >= CURRENT_DATE - INTERVAL '6 days'
-	`).Scan(&milk, &eggs, &wool, &value)
+	`).Scan(&milk, &milkCow, &milkGoat, &eggs, &wool, &meat, &value)
 	if err != nil {
 		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to load production summary"})
 		return
@@ -316,8 +452,12 @@ func (s *Server) handleProductionSummary(w http.ResponseWriter, r *http.Request)
 
 	respondJSON(w, http.StatusOK, map[string]any{
 		"weeklyMilk":         milk,
+		"weeklyMilkTotal":    milk,
+		"weeklyMilkCow":      milkCow,
+		"weeklyMilkGoat":     milkGoat,
 		"weeklyEggs":         eggs,
 		"weeklyWool":         wool,
+		"weeklyMeat":         meat,
 		"weeklyValue":        value,
 		"productivityChange": productivityChange,
 	})
@@ -333,7 +473,7 @@ func (s *Server) handleProductionLogs(w http.ResponseWriter, r *http.Request) {
 	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM production_logs`).Scan(&total)
 
 	rows, err := s.db.Query(ctx, `
-		SELECT id, log_date, milk_liters, eggs_count, wool_kg, total_value
+		SELECT id, log_date, milk_liters, milk_cow_liters, milk_goat_liters, eggs_count, wool_kg, meat_kg, total_value
 		FROM production_logs
 		ORDER BY log_date DESC
 		LIMIT $1 OFFSET $2
@@ -348,8 +488,8 @@ func (s *Server) handleProductionLogs(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var id int64
 		var d time.Time
-		var milk, eggs, wool, total float64
-		if err := rows.Scan(&id, &d, &milk, &eggs, &wool, &total); err != nil {
+		var milk, milkCow, milkGoat, eggs, wool, meat, total float64
+		if err := rows.Scan(&id, &d, &milk, &milkCow, &milkGoat, &eggs, &wool, &meat, &total); err != nil {
 			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to parse production logs"})
 			return
 		}
@@ -359,10 +499,16 @@ func (s *Server) handleProductionLogs(w http.ResponseWriter, r *http.Request) {
 			"dateRaw":    s.formatISODate(d),
 			"milk":       fmt.Sprintf("%.0f L", milk),
 			"milkValue":  milk,
+			"milkCow":    fmt.Sprintf("%.0f L", milkCow),
+			"milkCowValue": milkCow,
+			"milkGoat":     fmt.Sprintf("%.0f L", milkGoat),
+			"milkGoatValue": milkGoat,
 			"eggs":       fmt.Sprintf("%.0f units", eggs),
 			"eggsValue":  eggs,
 			"wool":       fmt.Sprintf("%.0f kg", wool),
 			"woolValue":  wool,
+			"meat":       fmt.Sprintf("%.0f kg", meat),
+			"meatValue":  meat,
 			"total":      formatKES(total),
 			"totalValue": total,
 		})
